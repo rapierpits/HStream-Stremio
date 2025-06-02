@@ -41,7 +41,7 @@ const manifest = {
         {
             type: 'movie',
             id: 'hstream-popular',
-            name: 'Most Viewed',
+            name: 'HStream - Most Viewed',
             extra: [
                 { name: 'skip', isRequired: false },
                 { name: 'search', isRequired: false }
