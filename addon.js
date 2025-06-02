@@ -1,8 +1,16 @@
 const { addonBuilder } = require('stremio-addon-sdk');
-const puppeteer = require('puppeteer-core');
 const express = require('express');
 const cors = require('cors');
-const ip = require('ip');
+
+let puppeteer;
+let chromium;
+
+if (process.env.RENDER) {
+    chromium = require('chrome-aws-lambda');
+    puppeteer = require('puppeteer-core');
+} else {
+    puppeteer = require('puppeteer-core');
+}
 
 const app = express();
 const port = process.env.PORT || 7000;
@@ -10,10 +18,8 @@ const port = process.env.PORT || 7000;
 // Get server URL based on environment
 function getServerURL() {
     if (process.env.RENDER) {
-        // On Render.com
         return `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`;
     }
-    // Locally
     try {
         const ip = require('ip');
         return `http://${ip.address()}:${port}`;
@@ -102,7 +108,6 @@ async function launchBrowser() {
     };
 
     if (process.env.RENDER) {
-        const chromium = require('chrome-aws-lambda');
         options = {
             ...options,
             executablePath: await chromium.executablePath,
