@@ -95,17 +95,12 @@ async function fetchCatalog(skip = 0, search = '') {
         
         debug(`Need more items. Loading pages ${pagesToLoad.join(', ')}`);
 
-        let browser;
-        try {
-            browser = await puppeteer.launch({
-                headless: true,
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--single-process'
-                ]
-            });
+    let browser;
+    try {
+        browser = await puppeteer.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
 
             // Fetch multiple pages in parallel
             const pagePromises = pagesToLoad.map(pageNum => fetchPage(browser, pageNum, search));
@@ -279,12 +274,7 @@ async function fetchVideoDetails(url) {
     try {
         browser = await puppeteer.launch({
             headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--single-process'
-            ]
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
         });
         const page = await browser.newPage();
         
@@ -631,12 +621,7 @@ builder.defineMetaHandler(async ({ id }) => {
             try {
                 browser = await puppeteer.launch({
                     headless: true,
-                    args: [
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--single-process'
-                    ]
+                    args: ['--no-sandbox', '--disable-setuid-sandbox']
                 });
                 const page = await browser.newPage();
                 
@@ -893,8 +878,7 @@ app.get('/:resource/:type/:id/:extra.json', async (req, res) => {
     res.json(result);
 });
 
-const servePort = process.env.PORT || 7000;
-app.listen(servePort, '0.0.0.0', () => {
-    console.log(`Addon running on port ${servePort}`);
-    console.log(`Install URL: ${process.env.PUBLIC_URL || `http://localhost:${servePort}`}/manifest.json`);
+app.listen(port, () => {
+    console.log(`Addon running on http://localhost:${port}`);
+    console.log(`Install URL: http://localhost:${port}/manifest.json`);
 });

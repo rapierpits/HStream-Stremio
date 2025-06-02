@@ -1,31 +1,43 @@
 # HStream Stremio Addon
 
-A Stremio addon for watching content from hstream.moe
+A Stremio addon that lets you watch content from hstream.moe directly in Stremio.
 
 ## Features
 
-- Browse and watch content from hstream.moe
+- Browse and watch videos from hstream.moe
 - High quality video streams (up to 4K)
-- Episode information and metadata
-- Pagination support for large catalogs
+- Pagination support for browsing large catalogs
+- Fast parallel loading of content
 
 ## Installation
 
-1. Open Stremio
-2. Click on the puzzle piece icon (addons)
-3. Paste the following URL in the "Addon Repository URL" field:
-   ```
-   https://hstream-stremio.onrender.com/manifest.json
-   ```
-4. Click Install
+1. Go to the addon URL (once deployed)
+2. Click "Install"
+3. Confirm the installation in Stremio
 
 ## Development
 
-To run locally:
+To run the addon locally:
 
 ```bash
 npm install
-node addon.js
+npm start
 ```
 
-The addon will be available at: http://localhost:7000 
+Then open `http://localhost:7000` in your browser and click "Install".
+
+## Deployment
+
+The addon can be deployed to Render.com:
+
+1. Fork this repository
+2. Create a new Web Service on Render
+3. Connect your GitHub repository
+4. Use the following settings:
+   - Build Command: `npm install`
+   - Start Command: `npm start`
+   - Node.js version: 16 or higher
+
+## License
+
+This project is for educational purposes only. 
