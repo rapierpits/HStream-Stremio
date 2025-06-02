@@ -1,11 +1,9 @@
 const { addonBuilder } = require('stremio-addon-sdk');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const puppeteer = require('puppeteer-core');
 const express = require('express');
 const cors = require('cors');
 const ip = require('ip');
 
-puppeteer.use(StealthPlugin());
 const app = express();
 const port = process.env.PORT || 7000;
 
@@ -91,8 +89,7 @@ const MAX_PAGES = 20;  // Questo ci darà un massimo di 10000 elementi
 const CONCURRENT_PAGES = 5;  // Manteniamo 5 pagine in parallelo
 
 async function launchBrowser() {
-    const options = {
-        headless: true,
+    let options = {
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -100,13 +97,23 @@ async function launchBrowser() {
             '--disable-accelerated-2d-canvas',
             '--disable-gpu',
             '--window-size=1920x1080'
-        ]
+        ],
+        headless: true
     };
 
     if (process.env.RENDER) {
-        // Su Render, usa Chrome installato nel sistema
         const chromium = require('chrome-aws-lambda');
-        options.executablePath = await chromium.executablePath;
+        options = {
+            ...options,
+            executablePath: await chromium.executablePath,
+            args: chromium.args,
+            defaultViewport: chromium.defaultViewport,
+            headless: chromium.headless
+        };
+    } else {
+        options.executablePath = process.platform === 'win32'
+            ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+            : '/usr/bin/google-chrome';
     }
 
     return await puppeteer.launch(options);
