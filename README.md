@@ -6,7 +6,6 @@ A Stremio addon for watching content from hstream.moe
 
 - Browse and watch content from hstream.moe
 - High quality video streams (up to 4K)
-- Multiple subtitle options
 - Episode information and metadata
 - Pagination support for large catalogs
 
