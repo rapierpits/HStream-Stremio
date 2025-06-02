@@ -90,6 +90,28 @@ const ITEMS_PER_PAGE = 500;  // Aumentato da 100 a 500
 const MAX_PAGES = 20;  // Questo ci darà un massimo di 10000 elementi
 const CONCURRENT_PAGES = 5;  // Manteniamo 5 pagine in parallelo
 
+async function launchBrowser() {
+    const options = {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--disable-gpu',
+            '--window-size=1920x1080'
+        ]
+    };
+
+    if (process.env.RENDER) {
+        // Su Render, usa Chrome installato nel sistema
+        const chromium = require('chrome-aws-lambda');
+        options.executablePath = await chromium.executablePath;
+    }
+
+    return await puppeteer.launch(options);
+}
+
 async function fetchCatalog(skip = 0, search = '') {
     debug(`Calculating pagination: skip=${skip}, pageNum=${Math.floor(skip / ITEMS_PER_PAGE) + 1}`);
     
@@ -111,12 +133,9 @@ async function fetchCatalog(skip = 0, search = '') {
         
         debug(`Need more items. Loading pages ${pagesToLoad.join(', ')}`);
 
-    let browser;
-    try {
-        browser = await puppeteer.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-        });
+        let browser;
+        try {
+            browser = await launchBrowser();
 
             // Fetch multiple pages in parallel
             const pagePromises = pagesToLoad.map(pageNum => fetchPage(browser, pageNum, search));
@@ -288,10 +307,7 @@ async function fetchVideoDetails(url) {
 
     let browser;
     try {
-        browser = await puppeteer.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-        });
+        browser = await launchBrowser();
         const page = await browser.newPage();
         
         await page.setRequestInterception(true);
@@ -635,10 +651,7 @@ builder.defineMetaHandler(async ({ id }) => {
             debug(`Trying to load page ${pageNum}`);
             let browser;
             try {
-                browser = await puppeteer.launch({
-                    headless: true,
-                    args: ['--no-sandbox', '--disable-setuid-sandbox']
-                });
+                browser = await launchBrowser();
                 const page = await browser.newPage();
                 
                 await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');

@@ -4,14 +4,19 @@
 	"description": "Stremio addon for hstream.moe",
 	"main": "addon.js",
 	"scripts": {
-		"start": "node addon.js"
+		"start": "node addon.js",
+		"build": "npm install"
 	},
 	"dependencies": {
 		"stremio-addon-sdk": "^1.6.10",
+		"puppeteer": "^21.7.0",
+		"puppeteer-core": "^21.7.0",
 		"puppeteer-extra": "^3.3.6",
 		"puppeteer-extra-plugin-stealth": "^2.11.2",
 		"express": "^4.18.2",
-		"cors": "^2.8.5"
+		"cors": "^2.8.5",
+		"ip": "^1.1.8",
+		"chrome-aws-lambda": "^10.1.0"
 	},
 	"engines": {
 		"node": ">=16"

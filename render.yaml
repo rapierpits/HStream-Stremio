@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: hstream-stremio
+    env: node
+    buildCommand: npm install
+    startCommand: node addon.js
+    envVars:
+      - key: NODE_VERSION
+        value: 18.17.0
+    buildFilter:
+      paths:
+      - addon.js
+      - package.json
+    plan: free
+    healthCheckPath: /manifest.json 
