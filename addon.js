@@ -3,10 +3,12 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const express = require('express');
 const cors = require('cors');
+const ip = require('ip');
 
 puppeteer.use(StealthPlugin());
 const app = express();
 const port = process.env.PORT || 7000;
+const localIp = ip.address();
 
 // Configurazione aggiornata
 const manifest = {
@@ -841,6 +843,9 @@ builder.defineStreamHandler(async ({ id }) => {
 // Server setup
 const addonInterface = builder.getInterface();
 app.use(cors());
+app.get('/', (_, res) => {
+    res.redirect('/manifest.json');
+});
 app.get('/manifest.json', (req, res) => res.json(addonInterface.manifest));
 app.get('/:resource/:type/:id.json', async (req, res) => {
     const { resource, type, id } = req.params;
@@ -852,12 +857,10 @@ app.get('/:resource/:type/:id/:extra.json', async (req, res) => {
     let extraObj = null;
     
     try {
-        // Handle both JSON and query string formats
         if (extra && extra !== 'undefined') {
             try {
                 extraObj = JSON.parse(decodeURIComponent(extra));
             } catch (e) {
-                // If JSON parsing fails, try to parse as query string
                 const params = new URLSearchParams(extra);
                 extraObj = {};
                 for (const [key, value] of params) {
@@ -878,7 +881,9 @@ app.get('/:resource/:type/:id/:extra.json', async (req, res) => {
     res.json(result);
 });
 
-app.listen(port, () => {
-    console.log(`Addon running on http://localhost:${port}`);
-    console.log(`Install URL: http://localhost:${port}/manifest.json`);
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Addon running on http://${localIp}:${port}`);
+    console.log(`Local URL: http://127.0.0.1:${port}`);
+    console.log(`Network URL: http://${localIp}:${port}`);
+    console.log(`Install URL: http://${localIp}:${port}/manifest.json`);
 });
