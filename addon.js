@@ -182,32 +182,69 @@ async function fetchCatalog(skip = 0, search = '') {
 }
 
 async function fetchPage(browser, pageNum, search = '') {
-        const page = await browser.newPage();
-
+    const page = await browser.newPage();
+    
     try {
+        // Set longer timeouts
+        await page.setDefaultNavigationTimeout(60000);
+        await page.setDefaultTimeout(60000);
+        
+        // Set up request interception to block unnecessary resources
+        await page.setRequestInterception(true);
+        page.on('request', (request) => {
+            const resourceType = request.resourceType();
+            if (resourceType === 'image' || resourceType === 'stylesheet' || resourceType === 'font') {
+                request.abort();
+            } else {
+                request.continue();
+            }
+        });
+
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-        await page.setJavaScriptEnabled(true);
 
         const baseUrl = search ? 
             `https://hstream.moe/search?q=${encodeURIComponent(search)}&page=${pageNum}&view=poster` : 
             `https://hstream.moe/search?view=poster&order=view-count&page=${pageNum}`;
 
         debug(`Fetching catalog from: ${baseUrl}`);
-        const response = await page.goto(baseUrl, { 
-            waitUntil: 'networkidle2', 
-            timeout: 30000 
-        });
+        
+        // Try to load the page with retries
+        let retries = 3;
+        let response;
+        while (retries > 0) {
+            try {
+                response = await page.goto(baseUrl, { 
+                    waitUntil: 'domcontentloaded',
+                    timeout: 60000 
+                });
+                if (response.status() === 200) break;
+                retries--;
+                if (retries > 0) await delay(2000); // Wait 2 seconds before retry
+            } catch (error) {
+                debug(`Error loading page ${pageNum}, retries left: ${retries-1}:`, error.message);
+                retries--;
+                if (retries === 0) throw error;
+                await delay(2000);
+            }
+        }
 
-        if (response.status() !== 200) {
-            debug(`Page ${pageNum} returned status ${response.status()}`);
+        if (!response || response.status() !== 200) {
+            debug(`Page ${pageNum} returned status ${response?.status() || 'unknown'}`);
             return [];
         }
 
-        await page.waitForSelector('div.grid', { timeout: 15000 });
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await delay(1000);
+        // Wait for content with a more specific selector
+        try {
+            await page.waitForSelector('div.grid', { 
+                timeout: 30000,
+                visible: true 
+            });
+        } catch (error) {
+            debug(`Timeout waiting for grid on page ${pageNum}, trying to continue anyway`);
+        }
 
-        return await page.evaluate(() => {
+        // Extract items even if some elements are not fully loaded
+        const items = await page.evaluate(() => {
             const results = [];
             const containers = [
                 ...document.querySelectorAll('div[wire\\:key^="episode-"]'),
@@ -223,22 +260,17 @@ async function fetchPage(browser, pageNum, search = '') {
                 try {
                     const link = item.tagName === 'A' ? item : item.querySelector('a');
                     if (!link || !link.href) return;
-
+                    
                     const href = link.href;
                     if (!href.includes('/hentai/')) return;
-                    
-                    // Extract episode number if present
-                    const episodeMatch = href.match(/-(\d+)$/);
-                    const episodeNumber = episodeMatch ? episodeMatch[1] : null;
                     
                     const urlParts = href.split('/hentai/');
                     if (urlParts.length < 2) return;
                     
                     const rawId = urlParts[1];
-                    // Modify the ID to include episode number if present
                     const baseId = rawId.replace(/\/?(?:-watch)?(?:-online)?(?:-free)?(?:-streaming)?(?:-sub)?(?:-eng)?(?:-ita)?(?:-\d+)?$/, '');
-                    const id = episodeNumber ? `${baseId}-${episodeNumber}` : baseId;
-                    if (!id) return;
+                    const episodeMatch = href.match(/-(\d+)$/);
+                    const id = episodeMatch ? `${baseId}-${episodeMatch[1]}` : baseId;
                     
                     const titleCandidates = [
                         link.querySelector('div.absolute p.text-sm'),
@@ -264,9 +296,8 @@ async function fetchPage(browser, pageNum, search = '') {
                         }
                     }
                     
-                    // Add episode number to title if present
-                    if (episodeNumber) {
-                        title = `${title} - ${episodeNumber}`;
+                    if (episodeMatch) {
+                        title = `${title} - ${episodeMatch[1]}`;
                     }
                     
                     const imgCandidates = [
@@ -285,15 +316,14 @@ async function fetchPage(browser, pageNum, search = '') {
                     if (poster && !poster.startsWith('http')) {
                         poster = `https://hstream.moe${poster}`;
                     }
-
+                    
                     results.push({
                         id: `hstream:${id}`,
                         type: 'movie',
                         name: title,
                         poster: poster,
                         posterShape: 'poster',
-                        link: href,
-                        episodeNumber: episodeNumber
+                        link: href
                     });
                 } catch (err) {
                     console.error(`Error processing item ${index}:`, err);
@@ -301,8 +331,13 @@ async function fetchPage(browser, pageNum, search = '') {
             });
             return results;
         });
+
+        return items;
+    } catch (error) {
+        debug(`Error processing page ${pageNum}:`, error.message);
+        return [];
     } finally {
-        await page.close();
+        await page.close().catch(() => {});
     }
 }
 
