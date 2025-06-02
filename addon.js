@@ -6,7 +6,7 @@ let puppeteer;
 let chromium;
 
 if (process.env.RENDER) {
-    chromium = require('chrome-aws-lambda');
+    chromium = require('@sparticuz/chromium');
     puppeteer = require('puppeteer-core');
 } else {
     puppeteer = require('puppeteer-core');
@@ -102,18 +102,17 @@ async function launchBrowser() {
             '--disable-dev-shm-usage',
             '--disable-accelerated-2d-canvas',
             '--disable-gpu',
-            '--window-size=1920x1080'
-        ],
-        headless: true
+            '--window-size=1920x1080',
+            '--headless=new'
+        ]
     };
 
     if (process.env.RENDER) {
         options = {
             ...options,
-            executablePath: await chromium.executablePath,
-            args: chromium.args,
-            defaultViewport: chromium.defaultViewport,
-            headless: chromium.headless
+            executablePath: await chromium.executablePath(),
+            headless: chromium.headless,
+            ignoreHTTPSErrors: true
         };
     } else {
         options.executablePath = process.platform === 'win32'
