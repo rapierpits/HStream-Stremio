@@ -8,7 +8,21 @@ const ip = require('ip');
 puppeteer.use(StealthPlugin());
 const app = express();
 const port = process.env.PORT || 7000;
-const localIp = ip.address();
+
+// Get server URL based on environment
+function getServerURL() {
+    if (process.env.RENDER) {
+        // On Render.com
+        return `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`;
+    }
+    // Locally
+    try {
+        const ip = require('ip');
+        return `http://${ip.address()}:${port}`;
+    } catch (e) {
+        return `http://localhost:${port}`;
+    }
+}
 
 // Configurazione aggiornata
 const manifest = {
@@ -881,9 +895,11 @@ app.get('/:resource/:type/:id/:extra.json', async (req, res) => {
     res.json(result);
 });
 
+const serverUrl = getServerURL();
 app.listen(port, '0.0.0.0', () => {
-    console.log(`Addon running on http://${localIp}:${port}`);
-    console.log(`Local URL: http://127.0.0.1:${port}`);
-    console.log(`Network URL: http://${localIp}:${port}`);
-    console.log(`Install URL: http://${localIp}:${port}/manifest.json`);
+    console.log(`Addon running on ${serverUrl}`);
+    if (!process.env.RENDER) {
+        console.log(`Local URL: http://127.0.0.1:${port}`);
+    }
+    console.log(`Install URL: ${serverUrl}/manifest.json`);
 });
