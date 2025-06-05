@@ -41,7 +41,17 @@ const manifest = {
         {
             type: 'movie',
             id: 'hstream-popular',
-            name: 'HStream - Most Viewed',
+            name: 'Most Viewed',
+            extra: [
+                { name: 'skip', isRequired: false },
+                { name: 'search', isRequired: false }
+            ],
+            pageSize: 500
+        },
+        {
+            type: 'movie',
+            id: 'hstream-recent',
+            name: 'Latest',
             extra: [
                 { name: 'skip', isRequired: false },
                 { name: 'search', isRequired: false }
@@ -123,11 +133,11 @@ async function launchBrowser() {
     return await puppeteer.launch(options);
 }
 
-async function fetchCatalog(skip = 0, search = '') {
-    debug(`Calculating pagination: skip=${skip}, pageNum=${Math.floor(skip / ITEMS_PER_PAGE) + 1}`);
+async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
+    debug(`Calculating pagination: skip=${skip}, pageNum=${Math.floor(skip / ITEMS_PER_PAGE) + 1}, catalogType=${catalogType}`);
     
     // Manteniamo una cache globale di tutti gli elementi
-    const globalCacheKey = search ? `search-${search}-all` : 'catalog-all';
+    const globalCacheKey = search ? `search-${search}-all` : `catalog-${catalogType}-all`;
     let allItems = catalogCache.get(globalCacheKey) || [];
     
     // Se non abbiamo abbastanza elementi nella cache per questo skip, dobbiamo caricare più pagine
@@ -149,7 +159,7 @@ async function fetchCatalog(skip = 0, search = '') {
             browser = await launchBrowser();
 
             // Fetch multiple pages in parallel
-            const pagePromises = pagesToLoad.map(pageNum => fetchPage(browser, pageNum, search));
+            const pagePromises = pagesToLoad.map(pageNum => fetchPage(browser, pageNum, search, catalogType));
             const pages = await Promise.all(pagePromises);
 
             const pageItems = pages.flat().filter(Boolean);
@@ -181,7 +191,7 @@ async function fetchCatalog(skip = 0, search = '') {
     return allItems.slice(start, end);
 }
 
-async function fetchPage(browser, pageNum, search = '') {
+async function fetchPage(browser, pageNum, search = '', catalogType = 'popular') {
     const page = await browser.newPage();
     
     try {
@@ -204,7 +214,7 @@ async function fetchPage(browser, pageNum, search = '') {
 
         const baseUrl = search ? 
             `https://hstream.moe/search?q=${encodeURIComponent(search)}&page=${pageNum}&view=poster` : 
-            `https://hstream.moe/search?view=poster&order=view-count&page=${pageNum}`;
+            `https://hstream.moe/search?view=poster&order=${catalogType === 'recent' ? 'recently-released' : 'view-count'}&page=${pageNum}`;
 
         debug(`Fetching catalog from: ${baseUrl}`);
         
@@ -644,7 +654,7 @@ async function fetchVideoDetails(url) {
 }
 
 // Handlers
-builder.defineCatalogHandler(async ({ extra }) => {
+builder.defineCatalogHandler(async ({ type, id, extra }) => {
     debug('Catalog request with extra:', extra);
     let skip = 0;
     let search = '';
@@ -662,8 +672,9 @@ builder.defineCatalogHandler(async ({ extra }) => {
         console.error('Error parsing extra params:', err);
     }
     
-    debug(`Processing catalog request: skip=${skip}, search="${search}"`);
-    const catalog = await fetchCatalog(skip, search);
+    const catalogType = id === 'hstream-recent' ? 'recent' : 'popular';
+    debug(`Processing catalog request: skip=${skip}, search="${search}", type=${catalogType}`);
+    const catalog = await fetchCatalog(skip, search, catalogType);
     
     const metas = catalog.map(item => ({
             id: item.id,
