@@ -448,11 +448,16 @@ async function fetchVideoDetails(url) {
                 else if (requestUrl.includes('720')) quality = '720p';
                 else if (requestUrl.includes('480')) quality = '480p';
                 else if (requestUrl.includes('360')) quality = '360p';
-                
-                // Only add streams with known quality
-                if (quality !== 'Unknown') {
-                    streams.set(quality, { url: requestUrl, quality });
+                else {
+                    // Try to detect quality from file name
+                    const qualityMatch = requestUrl.match(/(?:_|\b)(\d+)p\b/i);
+                    if (qualityMatch) {
+                        quality = qualityMatch[1] + 'p';
+                    }
                 }
+                
+                // Use quality as key to prevent duplicates
+                streams.set(quality, { url: requestUrl, quality });
                 request.abort();
             } else {
                 request.continue();
@@ -514,164 +519,9 @@ async function fetchVideoDetails(url) {
                     name: `${lang}${isAuto ? ' (Auto)' : ''}`
                 });
             });
-            
-            // Extract subtitles from tracks as fallback
-            console.log('Searching for track elements...');
-            document.querySelectorAll('track[kind="subtitles"], track[kind="captions"]').forEach(track => {
-                if (track.src) {
-                    const lang = track.srclang || 'und';
-                    const label = track.label || lang;
-                    console.log('Found track subtitle:', { src: track.src, lang, label });
-                    
-                    subtitles.set(lang, {
-                        url: track.src,
-                        lang: lang,
-                        id: label,
-                        format: track.src.split('.').pop().toLowerCase()
-                    });
-                }
-            });
-
-            // Process video sources
-            const videos = document.querySelectorAll('video');
-            videos.forEach(video => {
-                if (video.src) {
-                    const quality = video.getAttribute('size') || 'Default';
-                    sources.set(quality, {
-                        url: video.src,
-                        quality: quality
-                    });
-                }
-                
-                video.querySelectorAll('source').forEach(source => {
-                    if (source.src) {
-                        const quality = source.getAttribute('size') || 
-                                      source.getAttribute('label') || 
-                                      source.getAttribute('title') || 
-                                      'Unknown';
-                        sources.set(quality, {
-                            url: source.src,
-                            quality: quality
-                        });
-                    }
-                });
-
-                // Check for text tracks in video elements
-                video.querySelectorAll('track').forEach(track => {
-                    if (track.src && (track.kind === 'subtitles' || track.kind === 'captions')) {
-                        const lang = track.srclang || 'und';
-                        const label = track.label || lang;
-                        console.log('Found video track subtitle:', { src: track.src, lang, label });
-                        
-                        subtitles.set(lang, {
-                            url: track.src,
-                            lang: lang,
-                            id: label,
-                            format: track.src.split('.').pop().toLowerCase()
-                        });
-                    }
-                });
-            });
-            
-            const subtitleArray = Array.from(subtitles.values());
-            console.log(`Found ${subtitleArray.length} unique subtitles:`, subtitleArray);
-            
-            return {
-                sources: Array.from(sources.values()),
-                subtitles: subtitleArray
-            };
-        });
-
-        // Add video sources to our streams Map
-        videoData.sources.forEach(source => {
-            if (!streams.has(source.quality)) {
-                streams.set(source.quality, source);
-            }
-        });
-
-        const meta = await page.evaluate(() => {
-            // Get title from multiple sources
-            const title = document.querySelector('h1')?.textContent.trim() || 
-                         document.title.replace(' - HStream', '').replace(/in 4k.*$/, '').trim();
-            
-            // Get Japanese title if available
-            const japaneseTitle = document.querySelector('h2.inline')?.textContent.trim();
-            
-            // Get description from meta tags first (usually more complete)
-            const description = document.querySelector('meta[name="description"]')?.content ||
-                              document.querySelector('meta[property="og:description"]')?.content ||
-                              document.querySelector('.text-gray-800.dark\\:text-gray-200.leading-tight')?.textContent.trim() ||
-                              '';
-
-            // Get release date
-            const releaseDate = document.querySelector('a[data-te-toggle="tooltip"][title*="Released"]')?.textContent
-                                .match(/\d{4}-\d{2}-\d{2}/)?.[0];
-
-            // Get studio
-            const studio = document.querySelector('a[href*="studios"]')?.textContent.trim();
-
-            // Get all tags/genres
-            const genres = Array.from(document.querySelectorAll('ul li a[href*="tags"]'))
-                .map(tag => tag.textContent.trim())
-                .filter(tag => tag.length > 0);
-
-            // Get view count
-            const viewCount = document.querySelector('a.text-xl i.fa-eye')?.nextSibling?.textContent.trim();
-
-            // Get episode number
-            const episodeNumber = title.match(/\s*-\s*(\d+)$/)?.[1];
-
-            // Get subtitles
-            const subtitles = [];
-            const subtitleButtons = document.querySelectorAll('button.group.rounded-md.shadow.bg-rose-600');
-            
-            subtitleButtons.forEach(button => {
-                const link = button.querySelector('a[href*=".ass"], a[href*=".srt"], a[href*=".vtt"]');
-                if (!link) return;
-
-                const href = link.getAttribute('href');
-                if (!href) return;
-
-                // Get language from button text
-                const buttonText = button.textContent.trim();
-                const langMatch = buttonText.match(/^([A-Za-z]+)/);
-                
-                // Map language codes to ISO 639-2 codes
-                const langMap = {
-                    'English': 'eng',
-                    'German': 'ger',
-                    'Spanish': 'spa',
-                    'French': 'fre',
-                    'Hindi': 'hin',
-                    'Portuguese': 'por',
-                    'Russian': 'rus',
-                    'Italian': 'ita'
-                };
-
-                let lang = langMatch ? langMatch[1] : 'English';
-                const langCode = langMap[lang] || 'eng';
-
-                // Check if it's auto-translated
-                const isAuto = buttonText.toLowerCase().includes('auto translated');
-                
-                subtitles.push({
-                    url: href,
-                    lang: langCode,
-                    id: langCode,
-                    name: `${lang}${isAuto ? ' (Auto)' : ''}`
-                });
-            });
 
             return {
-                title,
-                japaneseTitle,
-                description,
-                releaseInfo: releaseDate,
-                studio,
-                genres,
-                viewCount,
-                episodeNumber,
-                subtitles
+                subtitles: Array.from(subtitles.values())
             };
         });
 
@@ -681,11 +531,22 @@ async function fetchVideoDetails(url) {
         const uniqueStreams = Array.from(streams.values())
             .filter(stream => {
                 try {
-                    // Filter out streams with unknown quality and ensure HTTPS
-                    return stream.quality !== 'Unknown' && new URL(stream.url).protocol === 'https:';
+                    return new URL(stream.url).protocol === 'https:';
                 } catch {
                     return false;
                 }
+            })
+            .sort((a, b) => {
+                // Sort streams by quality (4k > 1080p > 720p > 480p > 360p > Unknown)
+                const qualityOrder = {
+                    '4k': 5,
+                    '1080p': 4,
+                    '720p': 3,
+                    '480p': 2,
+                    '360p': 1,
+                    'Unknown': 0
+                };
+                return (qualityOrder[b.quality] || 0) - (qualityOrder[a.quality] || 0);
             })
             .map(stream => {
                 const streamData = {
@@ -707,21 +568,28 @@ async function fetchVideoDetails(url) {
                 return streamData;
             });
 
-        debug(`Found ${uniqueStreams.length} valid streams with ${videoData.subtitles?.length || 0} subtitle tracks`);
+        debug(`Found ${uniqueStreams.length} streams with ${videoData.subtitles?.length || 0} subtitle tracks`);
 
         const result = {
             ...meta,
-            streams: uniqueStreams
+            streams: uniqueStreams.length > 0 ? uniqueStreams : [{
+                title: 'Open in Browser',
+                externalUrl: url
+            }]
         };
 
         streamCache.set(cacheKey, result);
         return result;
+
     } catch (error) {
         console.error('Video details error:', error);
         if (browser) await browser.close();
         return { 
             title: 'Unknown', 
-            streams: [] 
+            streams: [{
+                title: 'Open in Browser',
+                externalUrl: url
+            }]
         };
     }
 }
