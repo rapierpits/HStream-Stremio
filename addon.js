@@ -113,8 +113,27 @@ async function launchBrowser() {
             '--disable-accelerated-2d-canvas',
             '--disable-gpu',
             '--window-size=1920x1080',
-            '--headless=new'
-        ]
+            '--headless=new',
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-site-isolation-trials',
+            '--no-experiments',
+            '--no-default-browser-check',
+            '--no-first-run',
+            '--disable-notifications',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-breakpad',
+            '--disable-component-extensions-with-background-pages',
+            '--disable-extensions',
+            '--disable-features=TranslateUI',
+            '--disable-ipc-flooding-protection',
+            '--disable-renderer-backgrounding',
+            '--force-color-profile=srgb',
+            '--metrics-recording-only',
+            '--mute-audio'
+        ],
+        timeout: 120000 // Increase launch timeout to 2 minutes
     };
 
     if (process.env.RENDER) {
@@ -130,7 +149,31 @@ async function launchBrowser() {
             : '/usr/bin/google-chrome';
     }
 
-    return await puppeteer.launch(options);
+    let retries = 3;
+    let browser;
+    
+    while (retries > 0) {
+        try {
+            browser = await puppeteer.launch(options);
+            // Test the browser by opening a page
+            const testPage = await browser.newPage();
+            await testPage.goto('about:blank');
+            await testPage.close();
+            return browser;
+        } catch (error) {
+            console.error(`Browser launch attempt failed (${retries} retries left):`, error.message);
+            if (browser) {
+                try {
+                    await browser.close();
+                } catch (e) {
+                    console.error('Error closing browser:', e.message);
+                }
+            }
+            retries--;
+            if (retries === 0) throw error;
+            await delay(5000); // Wait 5 seconds before retrying
+        }
+    }
 }
 
 async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
@@ -196,18 +239,27 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
     
     try {
         // Set longer timeouts
-        await page.setDefaultNavigationTimeout(60000);
-        await page.setDefaultTimeout(60000);
+        await page.setDefaultNavigationTimeout(120000); // 2 minutes
+        await page.setDefaultTimeout(120000); // 2 minutes
         
-        // Set up request interception to block unnecessary resources
+        // Optimize page performance
         await page.setRequestInterception(true);
         page.on('request', (request) => {
             const resourceType = request.resourceType();
-            if (resourceType === 'image' || resourceType === 'stylesheet' || resourceType === 'font') {
+            if (resourceType === 'image' || resourceType === 'stylesheet' || resourceType === 'font' || 
+                resourceType === 'media' || resourceType === 'other') {
                 request.abort();
             } else {
                 request.continue();
             }
+        });
+
+        // Set common headers
+        await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Connection': 'keep-alive',
+            'Accept-Encoding': 'gzip, deflate, br'
         });
 
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
@@ -224,23 +276,34 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
         while (retries > 0) {
             try {
                 response = await page.goto(baseUrl, { 
-                    waitUntil: 'domcontentloaded',
-                    timeout: 60000 
+                    waitUntil: ['domcontentloaded', 'networkidle2'],
+                    timeout: 120000 
                 });
-                if (response.status() === 200) break;
+                
+                if (response.status() === 200) {
+                    // Wait for content with a more specific selector and longer timeout
+                    await Promise.race([
+                        page.waitForSelector('div.grid', { timeout: 30000 }),
+                        page.waitForSelector('div[role="grid"]', { timeout: 30000 })
+                    ]);
+                    break;
+                }
+                
                 retries--;
-                if (retries > 0) await delay(2000); // Wait 2 seconds before retry
+                if (retries > 0) {
+                    debug(`Retrying page load (${retries} retries left)`);
+                    await delay(5000); // Wait 5 seconds before retry
+                }
             } catch (error) {
                 debug(`Error loading page ${pageNum}, retries left: ${retries-1}:`, error.message);
                 retries--;
                 if (retries === 0) throw error;
-                await delay(2000);
+                await delay(5000);
             }
         }
 
         if (!response || response.status() !== 200) {
-            debug(`Page ${pageNum} returned status ${response?.status() || 'unknown'}`);
-            return [];
+            throw new Error(`Failed to load page ${pageNum} (status: ${response?.status() || 'unknown'})`);
         }
 
         // Wait for content with a more specific selector
