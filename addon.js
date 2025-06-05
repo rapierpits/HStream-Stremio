@@ -120,76 +120,69 @@ async function launchBrowser() {
             '--no-experiments',
             '--no-default-browser-check',
             '--no-first-run',
+            '--disable-infobars',
             '--disable-notifications',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-breakpad',
-            '--disable-component-extensions-with-background-pages',
             '--disable-extensions',
-            '--disable-features=TranslateUI',
-            '--disable-ipc-flooding-protection',
-            '--disable-renderer-backgrounding',
-            '--force-color-profile=srgb',
-            '--metrics-recording-only',
-            '--mute-audio'
+            '--disable-sync',
+            '--no-zygote',
+            '--single-process'
         ],
-        timeout: 120000 // Increase launch timeout to 2 minutes
+        timeout: 120000, // Aumentiamo il timeout a 2 minuti
+        protocolTimeout: 120000,
+        waitForInitialPage: false
     };
 
     if (process.env.RENDER) {
-        options = {
-            ...options,
-            executablePath: await chromium.executablePath(),
-            headless: chromium.headless,
-            ignoreHTTPSErrors: true
-        };
+        try {
+            const executablePath = await chromium.executablePath();
+            debug('Chrome executable path:', executablePath);
+            
+            options = {
+                ...options,
+                executablePath,
+                headless: chromium.headless,
+                ignoreHTTPSErrors: true
+            };
+
+            // Aggiungiamo più log per il debug
+            debug('Launching browser with options:', JSON.stringify(options, null, 2));
+            
+            const browser = await puppeteer.launch(options);
+            debug('Browser launched successfully');
+            return browser;
+        } catch (error) {
+            console.error('Error launching browser:', error);
+            throw error;
+        }
     } else {
         options.executablePath = process.platform === 'win32'
             ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
             : '/usr/bin/google-chrome';
-    }
-
-    let retries = 3;
-    let browser;
-    
-    while (retries > 0) {
-        try {
-            browser = await puppeteer.launch(options);
-            // Test the browser by opening a page
-            const testPage = await browser.newPage();
-            await testPage.goto('about:blank');
-            await testPage.close();
-            return browser;
-        } catch (error) {
-            console.error(`Browser launch attempt failed (${retries} retries left):`, error.message);
-            if (browser) {
-                try {
-                    await browser.close();
-                } catch (e) {
-                    console.error('Error closing browser:', e.message);
-                }
-            }
-            retries--;
-            if (retries === 0) throw error;
-            await delay(5000); // Wait 5 seconds before retrying
-        }
+        return await puppeteer.launch(options);
     }
 }
 
 async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
     debug(`Calculating pagination: skip=${skip}, pageNum=${Math.floor(skip / ITEMS_PER_PAGE) + 1}, catalogType=${catalogType}`);
     
-    // Manteniamo una cache globale di tutti gli elementi
     const globalCacheKey = search ? `search-${search}-all` : `catalog-${catalogType}-all`;
     let allItems = catalogCache.get(globalCacheKey) || [];
     
-    // Se non abbiamo abbastanza elementi nella cache per questo skip, dobbiamo caricare più pagine
+    if (allItems.length >= skip + ITEMS_PER_PAGE) {
+        // Se abbiamo già abbastanza elementi in cache, li restituiamo subito
+        const start = skip;
+        const end = Math.min(skip + ITEMS_PER_PAGE, allItems.length);
+        return allItems.slice(start, end);
+    }
+
     while (allItems.length < skip + ITEMS_PER_PAGE && allItems.length < MAX_PAGES * ITEMS_PER_PAGE) {
         const nextPage = Math.floor(allItems.length / ITEMS_PER_PAGE) + 1;
+        
+        // Riduciamo il numero di pagine caricate in parallelo su Render
+        const maxConcurrentPages = process.env.RENDER ? 2 : CONCURRENT_PAGES;
         const pagesToLoad = [];
         
-        // Prepara il batch di pagine da caricare
-        for (let i = 0; i < CONCURRENT_PAGES && nextPage + i <= MAX_PAGES; i++) {
+        for (let i = 0; i < maxConcurrentPages && nextPage + i <= MAX_PAGES; i++) {
             pagesToLoad.push(nextPage + i);
         }
         
@@ -200,34 +193,46 @@ async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
         let browser;
         try {
             browser = await launchBrowser();
-
-            // Fetch multiple pages in parallel
-            const pagePromises = pagesToLoad.map(pageNum => fetchPage(browser, pageNum, search, catalogType));
-            const pages = await Promise.all(pagePromises);
-
-            const pageItems = pages.flat().filter(Boolean);
+            
+            // Fetch pages sequentially on Render, in parallel otherwise
+            const pageItems = process.env.RENDER ?
+                (await Promise.all(pagesToLoad.map(async pageNum => {
+                    try {
+                        return await fetchPage(browser, pageNum, search, catalogType);
+                    } catch (error) {
+                        console.error(`Error fetching page ${pageNum}:`, error);
+                        return [];
+                    }
+                }))).flat() :
+                (await Promise.all(pagesToLoad.map(pageNum => 
+                    fetchPage(browser, pageNum, search, catalogType)
+                ))).flat();
 
             if (pageItems.length === 0) {
-                debug(`No items found on pages ${pagesToLoad.join(', ')}, stopping pagination`);
+                debug('No items found, stopping pagination');
                 break;
             }
 
-            debug(`Found ${pageItems.length} items on pages ${pagesToLoad.join(', ')}`);
-            debug(`Total items in cache: ${allItems.length + pageItems.length}`);
-            
-            // Aggiungiamo i nuovi elementi alla cache globale
             allItems = [...allItems, ...pageItems];
             catalogCache.set(globalCacheKey, allItems);
+            debug(`Added ${pageItems.length} items to cache. Total items: ${allItems.length}`);
 
         } catch (error) {
             console.error(`Error fetching pages ${pagesToLoad.join(', ')}:`, error);
-            break;
+            // Se abbiamo alcuni elementi, li restituiamo invece di fallire completamente
+            if (allItems.length > 0) break;
+            throw error;
         } finally {
-            if (browser) await browser.close();
+            if (browser) {
+                try {
+                    await browser.close();
+                } catch (e) {
+                    debug(`Error closing browser: ${e.message}`);
+                }
+            }
         }
     }
 
-    // Restituiamo la porzione richiesta degli elementi
     const start = skip;
     const end = Math.min(skip + ITEMS_PER_PAGE, allItems.length);
     debug(`Returning items from ${start} to ${end} (total items: ${allItems.length})`);
@@ -235,15 +240,19 @@ async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
 }
 
 async function fetchPage(browser, pageNum, search = '', catalogType = 'popular') {
-    const page = await browser.newPage();
-    
+    let page;
     try {
-        // Set longer timeouts
-        await page.setDefaultNavigationTimeout(120000); // 2 minutes
-        await page.setDefaultTimeout(120000); // 2 minutes
+        page = await browser.newPage();
         
-        // Optimize page performance
+        // Aumentiamo i timeout
+        await page.setDefaultNavigationTimeout(120000);
+        await page.setDefaultTimeout(120000);
+        
+        // Ottimizziamo le performance
+        await page.setCacheEnabled(false);
         await page.setRequestInterception(true);
+        
+        // Blocchiamo le risorse non necessarie
         page.on('request', (request) => {
             const resourceType = request.resourceType();
             if (resourceType === 'image' || resourceType === 'stylesheet' || resourceType === 'font' || 
@@ -254,15 +263,13 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
             }
         });
 
-        // Set common headers
+        // Impostiamo headers personalizzati
         await page.setExtraHTTPHeaders({
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Connection': 'keep-alive',
-            'Accept-Encoding': 'gzip, deflate, br'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Connection': 'keep-alive'
         });
-
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
 
         const baseUrl = search ? 
             `https://hstream.moe/search?q=${encodeURIComponent(search)}&page=${pageNum}&view=poster` : 
@@ -270,50 +277,53 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
 
         debug(`Fetching catalog from: ${baseUrl}`);
         
-        // Try to load the page with retries
+        // Sistema di retry migliorato
         let retries = 3;
-        let response;
+        let lastError;
+        
         while (retries > 0) {
             try {
-                response = await page.goto(baseUrl, { 
-                    waitUntil: ['domcontentloaded', 'networkidle2'],
-                    timeout: 120000 
+                const response = await page.goto(baseUrl, { 
+                    waitUntil: ['domcontentloaded'],
+                    timeout: 60000
                 });
-                
-                if (response.status() === 200) {
-                    // Wait for content with a more specific selector and longer timeout
-                    await Promise.race([
-                        page.waitForSelector('div.grid', { timeout: 30000 }),
-                        page.waitForSelector('div[role="grid"]', { timeout: 30000 })
-                    ]);
-                    break;
+
+                if (!response) {
+                    throw new Error('No response received');
                 }
-                
-                retries--;
-                if (retries > 0) {
-                    debug(`Retrying page load (${retries} retries left)`);
-                    await delay(5000); // Wait 5 seconds before retry
+
+                if (response.status() === 200) {
+                    // Aspettiamo che il contenuto sia caricato
+                    try {
+                        await page.waitForSelector('div.grid', { 
+                            timeout: 30000,
+                            visible: true 
+                        });
+                        break; // Se arriviamo qui, il caricamento è riuscito
+                    } catch (err) {
+                        debug(`Timeout waiting for grid on page ${pageNum}, trying alternative selector`);
+                        // Proviamo un selettore alternativo
+                        await page.waitForSelector('div[role="grid"]', { 
+                            timeout: 30000,
+                            visible: true 
+                        });
+                        break;
+                    }
+                } else {
+                    throw new Error(`HTTP status ${response.status()}`);
                 }
             } catch (error) {
-                debug(`Error loading page ${pageNum}, retries left: ${retries-1}:`, error.message);
+                lastError = error;
                 retries--;
-                if (retries === 0) throw error;
-                await delay(5000);
+                if (retries > 0) {
+                    debug(`Retry ${3-retries}/3 for page ${pageNum}: ${error.message}`);
+                    await new Promise(resolve => setTimeout(resolve, 5000)); // Aspettiamo 5 secondi tra i retry
+                }
             }
         }
 
-        if (!response || response.status() !== 200) {
-            throw new Error(`Failed to load page ${pageNum} (status: ${response?.status() || 'unknown'})`);
-        }
-
-        // Wait for content with a more specific selector
-        try {
-            await page.waitForSelector('div.grid', { 
-                timeout: 30000,
-                visible: true 
-            });
-        } catch (error) {
-            debug(`Timeout waiting for grid on page ${pageNum}, trying to continue anyway`);
+        if (retries === 0) {
+            throw lastError || new Error('Max retries reached');
         }
 
         // Extract items even if some elements are not fully loaded
@@ -417,7 +427,13 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
         console.error(`Error processing page ${pageNum}:`, error);
         return [];
     } finally {
-        if (page) await page.close().catch(() => {});
+        if (page) {
+            try {
+                await page.close();
+            } catch (e) {
+                debug(`Error closing page: ${e.message}`);
+            }
+        }
     }
 }
 
@@ -466,68 +482,15 @@ async function fetchVideoDetails(url) {
         // Wait for video player to load
         await page.waitForSelector('video', { timeout: 30000 });
 
-        // Get metadata and subtitles from the page
-        const pageData = await page.evaluate(() => {
-            // Get title from multiple sources
-            const title = document.querySelector('h1')?.textContent.trim() || 
-                         document.title.replace(' - HStream', '').replace(/in 4k.*$/, '').trim();
-            
-            // Get Japanese title if available
-            const japaneseTitle = document.querySelector('h2.inline')?.textContent.trim();
-            
-            // Get description from meta tags first (usually more complete)
-            const description = document.querySelector('meta[name="description"]')?.content ||
-                              document.querySelector('meta[property="og:description"]')?.content ||
-                              document.querySelector('.text-gray-800.dark\\:text-gray-200.leading-tight')?.textContent.trim() ||
-                              '';
-
-            // Get release date
-            const releaseDate = document.querySelector('a[data-te-toggle="tooltip"][title*="Released"]')?.textContent
-                                .match(/\d{4}-\d{2}-\d{2}/)?.[0];
-
-            // Get studio
-            const studio = document.querySelector('a[href*="studios"]')?.textContent.trim();
-
-            // Get all tags/genres
-            const genres = Array.from(document.querySelectorAll('ul li a[href*="tags"]'))
-                .map(tag => tag.textContent.trim())
-                .filter(tag => tag.length > 0);
-
-            // Get view count
-            const viewCount = document.querySelector('a.text-xl i.fa-eye')?.nextSibling?.textContent.trim();
-
-            // Get episode number
-            const episodeNumber = title.match(/\s*-\s*(\d+)$/)?.[1];
-
-            // Process video sources
+        // Get video sources and subtitles from the page
+        const videoData = await page.evaluate(() => {
             const sources = new Map();
-            const videos = document.querySelectorAll('video');
-            videos.forEach(video => {
-                if (video.src) {
-                    const quality = video.getAttribute('size') || 'Default';
-                    sources.set(quality, {
-                        url: video.src,
-                        quality: quality
-                    });
-                }
-                
-                video.querySelectorAll('source').forEach(source => {
-                    if (source.src) {
-                        const quality = source.getAttribute('size') || 
-                                      source.getAttribute('label') || 
-                                      source.getAttribute('title') || 
-                                      'Unknown';
-                        sources.set(quality, {
-                            url: source.src,
-                            quality: quality
-                        });
-                    }
-                });
-            });
-
-            // Get subtitles
             const subtitles = new Map();
+            
+            console.log('Searching for subtitle download links...');
+            // Extract subtitles from download links first (higher priority)
             const subtitleButtons = document.querySelectorAll('button.group.rounded-md.shadow.bg-rose-600');
+            console.log(`Found ${subtitleButtons.length} potential subtitle buttons`);
             
             subtitleButtons.forEach(button => {
                 const link = button.querySelector('a[href*=".ass"], a[href*=".srt"], a[href*=".vtt"]');
@@ -565,31 +528,168 @@ async function fetchVideoDetails(url) {
                     name: `${lang}${isAuto ? ' (Auto)' : ''}`
                 });
             });
+            
+            // Extract subtitles from tracks as fallback
+            console.log('Searching for track elements...');
+            document.querySelectorAll('track[kind="subtitles"], track[kind="captions"]').forEach(track => {
+                if (track.src) {
+                    const lang = track.srclang || 'und';
+                    const label = track.label || lang;
+                    console.log('Found track subtitle:', { src: track.src, lang, label });
+                    
+                    subtitles.set(lang, {
+                        url: track.src,
+                        lang: lang,
+                        id: label,
+                        format: track.src.split('.').pop().toLowerCase()
+                    });
+                }
+            });
 
+            // Process video sources
+            const videos = document.querySelectorAll('video');
+            videos.forEach(video => {
+                if (video.src) {
+                    const quality = video.getAttribute('size') || 'Default';
+                    sources.set(quality, {
+                        url: video.src,
+                        quality: quality
+                    });
+                }
+                
+                video.querySelectorAll('source').forEach(source => {
+                    if (source.src) {
+                        const quality = source.getAttribute('size') || 
+                                      source.getAttribute('label') || 
+                                      source.getAttribute('title') || 
+                                      'Unknown';
+                        sources.set(quality, {
+                            url: source.src,
+                            quality: quality
+                        });
+                    }
+                });
+
+                // Check for text tracks in video elements
+                video.querySelectorAll('track').forEach(track => {
+                    if (track.src && (track.kind === 'subtitles' || track.kind === 'captions')) {
+                        const lang = track.srclang || 'und';
+                        const label = track.label || lang;
+                        console.log('Found video track subtitle:', { src: track.src, lang, label });
+                        
+                        subtitles.set(lang, {
+                            url: track.src,
+                            lang: lang,
+                            id: label,
+                            format: track.src.split('.').pop().toLowerCase()
+                        });
+                    }
+                });
+            });
+            
+            const subtitleArray = Array.from(subtitles.values());
+            console.log(`Found ${subtitleArray.length} unique subtitles:`, subtitleArray);
+            
             return {
-                meta: {
-                    title,
-                    japaneseTitle,
-                    description,
-                    releaseInfo: releaseDate,
-                    studio,
-                    genres,
-                    viewCount,
-                    episodeNumber
-                },
                 sources: Array.from(sources.values()),
-                subtitles: Array.from(subtitles.values())
+                subtitles: subtitleArray
             };
         });
 
-        await browser.close();
-
         // Add video sources to our streams Map
-        pageData.sources.forEach(source => {
+        videoData.sources.forEach(source => {
             if (!streams.has(source.quality)) {
                 streams.set(source.quality, source);
             }
         });
+
+        const meta = await page.evaluate(() => {
+            // Get title from multiple sources
+            const title = document.querySelector('h1')?.textContent.trim() || 
+                         document.title.replace(' - HStream', '').replace(/in 4k.*$/, '').trim();
+            
+            // Get Japanese title if available
+            const japaneseTitle = document.querySelector('h2.inline')?.textContent.trim();
+            
+            // Get description from meta tags first (usually more complete)
+            const description = document.querySelector('meta[name="description"]')?.content ||
+                              document.querySelector('meta[property="og:description"]')?.content ||
+                              document.querySelector('.text-gray-800.dark\\:text-gray-200.leading-tight')?.textContent.trim() ||
+                              '';
+
+            // Get release date
+            const releaseDate = document.querySelector('a[data-te-toggle="tooltip"][title*="Released"]')?.textContent
+                                .match(/\d{4}-\d{2}-\d{2}/)?.[0];
+
+            // Get studio
+            const studio = document.querySelector('a[href*="studios"]')?.textContent.trim();
+
+            // Get all tags/genres
+            const genres = Array.from(document.querySelectorAll('ul li a[href*="tags"]'))
+                .map(tag => tag.textContent.trim())
+                .filter(tag => tag.length > 0);
+
+            // Get view count
+            const viewCount = document.querySelector('a.text-xl i.fa-eye')?.nextSibling?.textContent.trim();
+
+            // Get episode number
+            const episodeNumber = title.match(/\s*-\s*(\d+)$/)?.[1];
+
+            // Get subtitles
+            const subtitles = [];
+            const subtitleButtons = document.querySelectorAll('button.group.rounded-md.shadow.bg-rose-600');
+            
+            subtitleButtons.forEach(button => {
+                const link = button.querySelector('a[href*=".ass"], a[href*=".srt"], a[href*=".vtt"]');
+                if (!link) return;
+
+                const href = link.getAttribute('href');
+                if (!href) return;
+
+                // Get language from button text
+                const buttonText = button.textContent.trim();
+                const langMatch = buttonText.match(/^([A-Za-z]+)/);
+                
+                // Map language codes to ISO 639-2 codes
+                const langMap = {
+                    'English': 'eng',
+                    'German': 'ger',
+                    'Spanish': 'spa',
+                    'French': 'fre',
+                    'Hindi': 'hin',
+                    'Portuguese': 'por',
+                    'Russian': 'rus',
+                    'Italian': 'ita'
+                };
+
+                let lang = langMatch ? langMatch[1] : 'English';
+                const langCode = langMap[lang] || 'eng';
+
+                // Check if it's auto-translated
+                const isAuto = buttonText.toLowerCase().includes('auto translated');
+                
+                subtitles.push({
+                    url: href,
+                    lang: langCode,
+                    id: langCode,
+                    name: `${lang}${isAuto ? ' (Auto)' : ''}`
+                });
+            });
+
+            return {
+                title,
+                japaneseTitle,
+                description,
+                releaseInfo: releaseDate,
+                studio,
+                genres,
+                viewCount,
+                episodeNumber,
+                subtitles
+            };
+        });
+
+        await browser.close();
 
         // Convert streams Map to array and format for Stremio
         const uniqueStreams = Array.from(streams.values())
@@ -604,11 +704,11 @@ async function fetchVideoDetails(url) {
                 const streamData = {
                     title: stream.quality,
                     url: stream.url,
-                    name: `${pageData.meta.title} (${stream.quality})`
+                    name: `${meta.title} (${stream.quality})`
                 };
 
-                if (pageData.subtitles && pageData.subtitles.length > 0) {
-                    streamData.subtitles = pageData.subtitles.map(sub => ({
+                if (videoData.subtitles && videoData.subtitles.length > 0) {
+                    streamData.subtitles = videoData.subtitles.map(sub => ({
                         id: sub.id,
                         url: sub.url,
                         lang: sub.lang,
@@ -620,28 +720,21 @@ async function fetchVideoDetails(url) {
                 return streamData;
             });
 
-        debug(`Found ${uniqueStreams.length} streams with ${pageData.subtitles?.length || 0} subtitle tracks`);
+        debug(`Found ${uniqueStreams.length} streams with ${videoData.subtitles.length} subtitle tracks`);
 
         const result = {
-            ...pageData.meta,
-            streams: uniqueStreams.length > 0 ? uniqueStreams : [{
-                title: 'Open in Browser',
-                externalUrl: url
-            }]
+            ...meta,
+            streams: uniqueStreams
         };
 
         streamCache.set(cacheKey, result);
         return result;
-
     } catch (error) {
         console.error('Video details error:', error);
         if (browser) await browser.close();
         return { 
             title: 'Unknown', 
-            streams: [{
-                title: 'Open in Browser',
-                externalUrl: url
-            }]
+            streams: [] 
         };
     }
 }
