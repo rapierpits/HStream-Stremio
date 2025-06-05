@@ -5,7 +5,10 @@ const cors = require('cors');
 let puppeteer;
 let chromium;
 
-if (process.env.RENDER) {
+// Verifichiamo se siamo su Render
+const isRender = process.env.RENDER || process.env.RENDER_EXTERNAL_HOSTNAME;
+
+if (isRender) {
     chromium = require('@sparticuz/chromium');
     puppeteer = require('puppeteer-core');
 } else {
@@ -117,20 +120,58 @@ async function launchBrowser() {
         ]
     };
 
-    if (process.env.RENDER) {
-        options = {
-            ...options,
-            executablePath: await chromium.executablePath(),
-            headless: chromium.headless,
-            ignoreHTTPSErrors: true
-        };
+    if (isRender) {
+        debug('Running on Render, using @sparticuz/chromium');
+        try {
+            options = {
+                ...options,
+                executablePath: await chromium.executablePath(),
+                headless: chromium.headless,
+                ignoreHTTPSErrors: true
+            };
+        } catch (error) {
+            console.error('Error configuring chromium on Render:', error);
+            throw error;
+        }
     } else {
-        options.executablePath = process.platform === 'win32'
-            ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
-            : '/usr/bin/google-chrome';
+        // Array di possibili percorsi di Chrome su Windows
+        const windowsChromePaths = [
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+            process.env.PROGRAMFILES + '\\Google\\Chrome\\Application\\chrome.exe',
+            process.env['PROGRAMFILES(X86)'] + '\\Google\\Chrome\\Application\\chrome.exe',
+        ];
+
+        // Cerca il primo percorso valido
+        let chromePath = null;
+        for (const path of windowsChromePaths) {
+            try {
+                if (require('fs').existsSync(path)) {
+                    chromePath = path;
+                    break;
+                }
+            } catch (e) {
+                continue;
+            }
+        }
+
+        if (!chromePath) {
+            throw new Error('Chrome non trovato. Assicurati che Chrome sia installato nel tuo sistema.');
+        }
+
+        options.executablePath = chromePath;
     }
 
-    return await puppeteer.launch(options);
+    try {
+        debug('Launching browser with options:', JSON.stringify(options, null, 2));
+        const browser = await puppeteer.launch(options);
+        debug('Browser launched successfully');
+        return browser;
+    } catch (error) {
+        console.error('Error launching browser:', error);
+        throw error;
+    }
 }
 
 async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
