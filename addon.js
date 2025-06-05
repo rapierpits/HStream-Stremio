@@ -448,13 +448,6 @@ async function fetchVideoDetails(url) {
                 else if (requestUrl.includes('720')) quality = '720p';
                 else if (requestUrl.includes('480')) quality = '480p';
                 else if (requestUrl.includes('360')) quality = '360p';
-                else {
-                    // Try to detect quality from file name
-                    const qualityMatch = requestUrl.match(/(?:_|\b)(\d+)p\b/i);
-                    if (qualityMatch) {
-                        quality = qualityMatch[1] + 'p';
-                    }
-                }
                 
                 // Use quality as key to prevent duplicates
                 streams.set(quality, { url: requestUrl, quality });
@@ -505,6 +498,32 @@ async function fetchVideoDetails(url) {
 
             // Get episode number
             const episodeNumber = title.match(/\s*-\s*(\d+)$/)?.[1];
+
+            // Process video sources
+            const sources = new Map();
+            const videos = document.querySelectorAll('video');
+            videos.forEach(video => {
+                if (video.src) {
+                    const quality = video.getAttribute('size') || 'Default';
+                    sources.set(quality, {
+                        url: video.src,
+                        quality: quality
+                    });
+                }
+                
+                video.querySelectorAll('source').forEach(source => {
+                    if (source.src) {
+                        const quality = source.getAttribute('size') || 
+                                      source.getAttribute('label') || 
+                                      source.getAttribute('title') || 
+                                      'Unknown';
+                        sources.set(quality, {
+                            url: source.src,
+                            quality: quality
+                        });
+                    }
+                });
+            });
 
             // Get subtitles
             const subtitles = new Map();
@@ -558,11 +577,19 @@ async function fetchVideoDetails(url) {
                     viewCount,
                     episodeNumber
                 },
+                sources: Array.from(sources.values()),
                 subtitles: Array.from(subtitles.values())
             };
         });
 
         await browser.close();
+
+        // Add video sources to our streams Map
+        pageData.sources.forEach(source => {
+            if (!streams.has(source.quality)) {
+                streams.set(source.quality, source);
+            }
+        });
 
         // Convert streams Map to array and format for Stremio
         const uniqueStreams = Array.from(streams.values())
@@ -572,18 +599,6 @@ async function fetchVideoDetails(url) {
                 } catch {
                     return false;
                 }
-            })
-            .sort((a, b) => {
-                // Sort streams by quality (4k > 1080p > 720p > 480p > 360p > Unknown)
-                const qualityOrder = {
-                    '4k': 5,
-                    '1080p': 4,
-                    '720p': 3,
-                    '480p': 2,
-                    '360p': 1,
-                    'Unknown': 0
-                };
-                return (qualityOrder[b.quality] || 0) - (qualityOrder[a.quality] || 0);
             })
             .map(stream => {
                 const streamData = {
