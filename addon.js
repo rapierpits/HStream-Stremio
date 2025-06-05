@@ -846,14 +846,82 @@ builder.defineMetaHandler(async ({ id }) => {
 builder.defineStreamHandler(async ({ id }) => {
     debug('Stream request for id:', id);
     
-    // Get all items from the global cache
-    const allItems = catalogCache.get('catalog-all') || [];
-    debug(`Searching for item ${id} in ${allItems.length} cached items`);
+    // Extract catalog type from ID
+    const [prefix, catalogType, ...rest] = id.split(':');
+    const itemId = rest.join(':'); // In case the original ID contained colons
+    debug(`Processing stream request for ${catalogType} catalog, item ID: ${itemId}`);
+    
+    // Get items from the correct cache
+    const cacheKey = `catalog-${catalogType}-all`;
+    const cachedItems = catalogCache.get(cacheKey) || [];
+    debug(`Searching for item in ${cachedItems.length} cached items from ${catalogType} catalog`);
     
     // Find the item in the cache
-    const item = allItems.find(i => i.id === id);
+    let item = cachedItems.find(i => i.id === id);
+    
+    // If not found in cache, try to load more pages until we find it
     if (!item) {
-        debug(`Item ${id} not found in cache`);
+        debug('Item not found in cache, trying to load more pages');
+        let pageNum = 1;
+        let found = false;
+        let browser;
+        
+        while (!found && pageNum <= MAX_PAGES) {
+            try {
+                browser = await launchBrowser();
+                const page = await browser.newPage();
+                
+                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+                await page.setJavaScriptEnabled(true);
+                
+                const baseUrl = `https://hstream.moe/search?view=poster&order=${catalogType === 'recent' ? 'recently-released' : 'view-count'}&page=${pageNum}`;
+                debug(`Fetching catalog from: ${baseUrl}`);
+                
+                const response = await page.goto(baseUrl, { 
+                    waitUntil: 'networkidle2', 
+                    timeout: 30000 
+                });
+                
+                if (response.status() !== 200) {
+                    debug(`Page ${pageNum} returned status ${response.status()}, stopping search`);
+                    break;
+                }
+                
+                await page.waitForSelector('div.grid', { timeout: 15000 });
+                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+                await delay(1000);
+                
+                const pageItems = await fetchPage(browser, pageNum, '', catalogType);
+                
+                if (pageItems.length === 0) {
+                    debug(`No items found on page ${pageNum}, stopping search`);
+                    break;
+                }
+                
+                // Add new items to cache
+                cachedItems.push(...pageItems);
+                catalogCache.set(cacheKey, cachedItems);
+                
+                // Check if we found our item
+                item = pageItems.find(i => i.id === id);
+                if (item) {
+                    debug(`Found item on page ${pageNum}`);
+                    found = true;
+                    break;
+                }
+                
+                pageNum++;
+            } catch (error) {
+                console.error(`Error fetching page ${pageNum}:`, error);
+                break;
+            } finally {
+                if (browser) await browser.close();
+            }
+        }
+    }
+    
+    if (!item) {
+        debug(`Item ${id} not found in catalog`);
         return { streams: [] };
     }
     
@@ -879,6 +947,8 @@ builder.defineStreamHandler(async ({ id }) => {
             }
             return stream;
         });
+        
+        debug(`Found ${details.streams.length} streams with ${details.subtitles?.length || 0} subtitle tracks`);
     }
     
     return { streams: details.streams };
