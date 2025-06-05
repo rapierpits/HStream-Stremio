@@ -113,76 +113,40 @@ async function launchBrowser() {
             '--disable-accelerated-2d-canvas',
             '--disable-gpu',
             '--window-size=1920x1080',
-            '--headless=new',
-            '--disable-web-security',
-            '--disable-features=IsolateOrigins,site-per-process',
-            '--disable-site-isolation-trials',
-            '--no-experiments',
-            '--no-default-browser-check',
-            '--no-first-run',
-            '--disable-infobars',
-            '--disable-notifications',
-            '--disable-extensions',
-            '--disable-sync',
-            '--no-zygote',
-            '--single-process'
-        ],
-        timeout: 120000, // Aumentiamo il timeout a 2 minuti
-        protocolTimeout: 120000,
-        waitForInitialPage: false
+            '--headless=new'
+        ]
     };
 
     if (process.env.RENDER) {
-        try {
-            const executablePath = await chromium.executablePath();
-            debug('Chrome executable path:', executablePath);
-            
-            options = {
-                ...options,
-                executablePath,
-                headless: chromium.headless,
-                ignoreHTTPSErrors: true
-            };
-
-            // Aggiungiamo più log per il debug
-            debug('Launching browser with options:', JSON.stringify(options, null, 2));
-            
-            const browser = await puppeteer.launch(options);
-            debug('Browser launched successfully');
-            return browser;
-        } catch (error) {
-            console.error('Error launching browser:', error);
-            throw error;
-        }
+        options = {
+            ...options,
+            executablePath: await chromium.executablePath(),
+            headless: chromium.headless,
+            ignoreHTTPSErrors: true
+        };
     } else {
         options.executablePath = process.platform === 'win32'
             ? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
             : '/usr/bin/google-chrome';
-        return await puppeteer.launch(options);
     }
+
+    return await puppeteer.launch(options);
 }
 
 async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
     debug(`Calculating pagination: skip=${skip}, pageNum=${Math.floor(skip / ITEMS_PER_PAGE) + 1}, catalogType=${catalogType}`);
     
+    // Manteniamo una cache globale di tutti gli elementi
     const globalCacheKey = search ? `search-${search}-all` : `catalog-${catalogType}-all`;
     let allItems = catalogCache.get(globalCacheKey) || [];
     
-    if (allItems.length >= skip + ITEMS_PER_PAGE) {
-        // Se abbiamo già abbastanza elementi in cache, li restituiamo subito
-        const start = skip;
-        const end = Math.min(skip + ITEMS_PER_PAGE, allItems.length);
-        return allItems.slice(start, end);
-    }
-
+    // Se non abbiamo abbastanza elementi nella cache per questo skip, dobbiamo caricare più pagine
     while (allItems.length < skip + ITEMS_PER_PAGE && allItems.length < MAX_PAGES * ITEMS_PER_PAGE) {
         const nextPage = Math.floor(allItems.length / ITEMS_PER_PAGE) + 1;
-        
-        // Riduciamo il numero di pagine caricate in parallelo su Render
-        const maxConcurrentPages = process.env.RENDER ? 2 : CONCURRENT_PAGES;
         const pagesToLoad = [];
         
-        for (let i = 0; i < maxConcurrentPages && nextPage + i <= MAX_PAGES; i++) {
+        // Prepara il batch di pagine da caricare
+        for (let i = 0; i < CONCURRENT_PAGES && nextPage + i <= MAX_PAGES; i++) {
             pagesToLoad.push(nextPage + i);
         }
         
@@ -193,46 +157,34 @@ async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
         let browser;
         try {
             browser = await launchBrowser();
-            
-            // Fetch pages sequentially on Render, in parallel otherwise
-            const pageItems = process.env.RENDER ?
-                (await Promise.all(pagesToLoad.map(async pageNum => {
-                    try {
-                        return await fetchPage(browser, pageNum, search, catalogType);
-                    } catch (error) {
-                        console.error(`Error fetching page ${pageNum}:`, error);
-                        return [];
-                    }
-                }))).flat() :
-                (await Promise.all(pagesToLoad.map(pageNum => 
-                    fetchPage(browser, pageNum, search, catalogType)
-                ))).flat();
+
+            // Fetch multiple pages in parallel
+            const pagePromises = pagesToLoad.map(pageNum => fetchPage(browser, pageNum, search, catalogType));
+            const pages = await Promise.all(pagePromises);
+
+            const pageItems = pages.flat().filter(Boolean);
 
             if (pageItems.length === 0) {
-                debug('No items found, stopping pagination');
+                debug(`No items found on pages ${pagesToLoad.join(', ')}, stopping pagination`);
                 break;
             }
 
+            debug(`Found ${pageItems.length} items on pages ${pagesToLoad.join(', ')}`);
+            debug(`Total items in cache: ${allItems.length + pageItems.length}`);
+            
+            // Aggiungiamo i nuovi elementi alla cache globale
             allItems = [...allItems, ...pageItems];
             catalogCache.set(globalCacheKey, allItems);
-            debug(`Added ${pageItems.length} items to cache. Total items: ${allItems.length}`);
 
         } catch (error) {
             console.error(`Error fetching pages ${pagesToLoad.join(', ')}:`, error);
-            // Se abbiamo alcuni elementi, li restituiamo invece di fallire completamente
-            if (allItems.length > 0) break;
-            throw error;
+            break;
         } finally {
-            if (browser) {
-                try {
-                    await browser.close();
-                } catch (e) {
-                    debug(`Error closing browser: ${e.message}`);
-                }
-            }
+            if (browser) await browser.close();
         }
     }
 
+    // Restituiamo la porzione richiesta degli elementi
     const start = skip;
     const end = Math.min(skip + ITEMS_PER_PAGE, allItems.length);
     debug(`Returning items from ${start} to ${end} (total items: ${allItems.length})`);
@@ -240,36 +192,25 @@ async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
 }
 
 async function fetchPage(browser, pageNum, search = '', catalogType = 'popular') {
-    let page;
+    const page = await browser.newPage();
+    
     try {
-        page = await browser.newPage();
+        // Set longer timeouts
+        await page.setDefaultNavigationTimeout(60000);
+        await page.setDefaultTimeout(60000);
         
-        // Aumentiamo i timeout
-        await page.setDefaultNavigationTimeout(120000);
-        await page.setDefaultTimeout(120000);
-        
-        // Ottimizziamo le performance
-        await page.setCacheEnabled(false);
+        // Set up request interception to block unnecessary resources
         await page.setRequestInterception(true);
-        
-        // Blocchiamo le risorse non necessarie
         page.on('request', (request) => {
             const resourceType = request.resourceType();
-            if (resourceType === 'image' || resourceType === 'stylesheet' || resourceType === 'font' || 
-                resourceType === 'media' || resourceType === 'other') {
+            if (resourceType === 'image' || resourceType === 'stylesheet' || resourceType === 'font') {
                 request.abort();
             } else {
                 request.continue();
             }
         });
 
-        // Impostiamo headers personalizzati
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Connection': 'keep-alive'
-        });
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
 
         const baseUrl = search ? 
             `https://hstream.moe/search?q=${encodeURIComponent(search)}&page=${pageNum}&view=poster` : 
@@ -277,53 +218,39 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
 
         debug(`Fetching catalog from: ${baseUrl}`);
         
-        // Sistema di retry migliorato
+        // Try to load the page with retries
         let retries = 3;
-        let lastError;
-        
+        let response;
         while (retries > 0) {
             try {
-                const response = await page.goto(baseUrl, { 
-                    waitUntil: ['domcontentloaded'],
-                    timeout: 60000
+                response = await page.goto(baseUrl, { 
+                    waitUntil: 'domcontentloaded',
+                    timeout: 60000 
                 });
-
-                if (!response) {
-                    throw new Error('No response received');
-                }
-
-                if (response.status() === 200) {
-                    // Aspettiamo che il contenuto sia caricato
-                    try {
-                        await page.waitForSelector('div.grid', { 
-                            timeout: 30000,
-                            visible: true 
-                        });
-                        break; // Se arriviamo qui, il caricamento è riuscito
-                    } catch (err) {
-                        debug(`Timeout waiting for grid on page ${pageNum}, trying alternative selector`);
-                        // Proviamo un selettore alternativo
-                        await page.waitForSelector('div[role="grid"]', { 
-                            timeout: 30000,
-                            visible: true 
-                        });
-                        break;
-                    }
-                } else {
-                    throw new Error(`HTTP status ${response.status()}`);
-                }
-            } catch (error) {
-                lastError = error;
+                if (response.status() === 200) break;
                 retries--;
-                if (retries > 0) {
-                    debug(`Retry ${3-retries}/3 for page ${pageNum}: ${error.message}`);
-                    await new Promise(resolve => setTimeout(resolve, 5000)); // Aspettiamo 5 secondi tra i retry
-                }
+                if (retries > 0) await delay(2000); // Wait 2 seconds before retry
+            } catch (error) {
+                debug(`Error loading page ${pageNum}, retries left: ${retries-1}:`, error.message);
+                retries--;
+                if (retries === 0) throw error;
+                await delay(2000);
             }
         }
 
-        if (retries === 0) {
-            throw lastError || new Error('Max retries reached');
+        if (!response || response.status() !== 200) {
+            debug(`Page ${pageNum} returned status ${response?.status() || 'unknown'}`);
+            return [];
+        }
+
+        // Wait for content with a more specific selector
+        try {
+            await page.waitForSelector('div.grid', { 
+                timeout: 30000,
+                visible: true 
+            });
+        } catch (error) {
+            debug(`Timeout waiting for grid on page ${pageNum}, trying to continue anyway`);
         }
 
         // Extract items even if some elements are not fully loaded
@@ -427,13 +354,7 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
         console.error(`Error processing page ${pageNum}:`, error);
         return [];
     } finally {
-        if (page) {
-            try {
-                await page.close();
-            } catch (e) {
-                debug(`Error closing page: ${e.message}`);
-            }
-        }
+        if (page) await page.close().catch(() => {});
     }
 }
 
