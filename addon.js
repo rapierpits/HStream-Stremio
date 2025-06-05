@@ -473,15 +473,42 @@ async function fetchVideoDetails(url) {
         // Wait for video player to load
         await page.waitForSelector('video', { timeout: 30000 });
 
-        // Get video sources and subtitles from the page
-        const videoData = await page.evaluate(() => {
-            const sources = new Map();
-            const subtitles = new Map();
+        // Get metadata and subtitles from the page
+        const pageData = await page.evaluate(() => {
+            // Get title from multiple sources
+            const title = document.querySelector('h1')?.textContent.trim() || 
+                         document.title.replace(' - HStream', '').replace(/in 4k.*$/, '').trim();
             
-            console.log('Searching for subtitle download links...');
-            // Extract subtitles from download links first (higher priority)
+            // Get Japanese title if available
+            const japaneseTitle = document.querySelector('h2.inline')?.textContent.trim();
+            
+            // Get description from meta tags first (usually more complete)
+            const description = document.querySelector('meta[name="description"]')?.content ||
+                              document.querySelector('meta[property="og:description"]')?.content ||
+                              document.querySelector('.text-gray-800.dark\\:text-gray-200.leading-tight')?.textContent.trim() ||
+                              '';
+
+            // Get release date
+            const releaseDate = document.querySelector('a[data-te-toggle="tooltip"][title*="Released"]')?.textContent
+                                .match(/\d{4}-\d{2}-\d{2}/)?.[0];
+
+            // Get studio
+            const studio = document.querySelector('a[href*="studios"]')?.textContent.trim();
+
+            // Get all tags/genres
+            const genres = Array.from(document.querySelectorAll('ul li a[href*="tags"]'))
+                .map(tag => tag.textContent.trim())
+                .filter(tag => tag.length > 0);
+
+            // Get view count
+            const viewCount = document.querySelector('a.text-xl i.fa-eye')?.nextSibling?.textContent.trim();
+
+            // Get episode number
+            const episodeNumber = title.match(/\s*-\s*(\d+)$/)?.[1];
+
+            // Get subtitles
+            const subtitles = new Map();
             const subtitleButtons = document.querySelectorAll('button.group.rounded-md.shadow.bg-rose-600');
-            console.log(`Found ${subtitleButtons.length} potential subtitle buttons`);
             
             subtitleButtons.forEach(button => {
                 const link = button.querySelector('a[href*=".ass"], a[href*=".srt"], a[href*=".vtt"]');
@@ -521,6 +548,16 @@ async function fetchVideoDetails(url) {
             });
 
             return {
+                meta: {
+                    title,
+                    japaneseTitle,
+                    description,
+                    releaseInfo: releaseDate,
+                    studio,
+                    genres,
+                    viewCount,
+                    episodeNumber
+                },
                 subtitles: Array.from(subtitles.values())
             };
         });
@@ -552,11 +589,11 @@ async function fetchVideoDetails(url) {
                 const streamData = {
                     title: stream.quality,
                     url: stream.url,
-                    name: `${meta.title} (${stream.quality})`
+                    name: `${pageData.meta.title} (${stream.quality})`
                 };
 
-                if (videoData.subtitles && videoData.subtitles.length > 0) {
-                    streamData.subtitles = videoData.subtitles.map(sub => ({
+                if (pageData.subtitles && pageData.subtitles.length > 0) {
+                    streamData.subtitles = pageData.subtitles.map(sub => ({
                         id: sub.id,
                         url: sub.url,
                         lang: sub.lang,
@@ -568,10 +605,10 @@ async function fetchVideoDetails(url) {
                 return streamData;
             });
 
-        debug(`Found ${uniqueStreams.length} streams with ${videoData.subtitles?.length || 0} subtitle tracks`);
+        debug(`Found ${uniqueStreams.length} streams with ${pageData.subtitles?.length || 0} subtitle tracks`);
 
         const result = {
-            ...meta,
+            ...pageData.meta,
             streams: uniqueStreams.length > 0 ? uniqueStreams : [{
                 title: 'Open in Browser',
                 externalUrl: url
