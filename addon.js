@@ -421,24 +421,14 @@ async function fetchVideoDetails(url) {
             const requestUrl = request.url();
             if (requestUrl.match(/\.(m3u8|mp4|mkv|avi|mov)(\?|$)/i)) {
                 let quality = 'Unknown';
-                if (requestUrl.includes('2160')) quality = '2160p';
+                if (requestUrl.includes('2160')) quality = '4k';
                 else if (requestUrl.includes('1080')) quality = '1080p';
                 else if (requestUrl.includes('720')) quality = '720p';
                 else if (requestUrl.includes('480')) quality = '480p';
                 else if (requestUrl.includes('360')) quality = '360p';
                 
-                // Skip unknown quality streams
-                if (quality === 'Unknown') {
-                    request.abort();
-                    return;
-                }
-
                 // Use quality as key to prevent duplicates
-                streams.set(quality, {
-                    url: requestUrl,
-                    quality: quality,
-                    qualityNum: parseInt(quality) || 0
-                });
+                streams.set(quality, { url: requestUrl, quality });
                 request.abort();
             } else {
                 request.continue();
@@ -523,12 +513,10 @@ async function fetchVideoDetails(url) {
             videos.forEach(video => {
                 if (video.src) {
                     const quality = video.getAttribute('size') || 'Default';
-                    if (quality !== 'Unknown') {
-                        sources.set(quality, {
-                            url: video.src,
-                            quality: quality
-                        });
-                    }
+                    sources.set(quality, {
+                        url: video.src,
+                        quality: quality
+                    });
                 }
                 
                 video.querySelectorAll('source').forEach(source => {
@@ -537,12 +525,10 @@ async function fetchVideoDetails(url) {
                                       source.getAttribute('label') || 
                                       source.getAttribute('title') || 
                                       'Unknown';
-                        if (quality !== 'Unknown') {
-                            sources.set(quality, {
-                                url: source.src,
-                                quality: quality
-                            });
-                        }
+                        sources.set(quality, {
+                            url: source.src,
+                            quality: quality
+                        });
                     }
                 });
 
@@ -574,18 +560,8 @@ async function fetchVideoDetails(url) {
 
         // Add video sources to our streams Map
         videoData.sources.forEach(source => {
-            if (!streams.has(source.quality) && source.quality !== 'Unknown') {
-                let qualityNum = 0;
-                if (source.quality.includes('2160')) qualityNum = 2160;
-                else if (source.quality.includes('1080')) qualityNum = 1080;
-                else if (source.quality.includes('720')) qualityNum = 720;
-                else if (source.quality.includes('480')) qualityNum = 480;
-                else if (source.quality.includes('360')) qualityNum = 360;
-
-                streams.set(source.quality, {
-                    ...source,
-                    qualityNum
-                });
+            if (!streams.has(source.quality)) {
+                streams.set(source.quality, source);
             }
         });
 
@@ -686,20 +662,11 @@ async function fetchVideoDetails(url) {
                     return false;
                 }
             })
-            .sort((a, b) => b.qualityNum - a.qualityNum) // Sort by quality (highest first)
             .map(stream => {
-                const qualityDesc = {
-                    '2160p': '4K Ultra HD',
-                    '1080p': 'Full HD',
-                    '720p': 'HD',
-                    '480p': 'SD',
-                    '360p': 'Low Quality'
-                };
-
                 const streamData = {
-                    title: qualityDesc[stream.quality] || stream.quality,
+                    title: stream.quality,
                     url: stream.url,
-                    name: `${meta.title} (${qualityDesc[stream.quality] || stream.quality})`
+                    name: `${meta.title} (${stream.quality})`
                 };
 
                 if (videoData.subtitles && videoData.subtitles.length > 0) {
