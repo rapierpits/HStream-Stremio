@@ -41,7 +41,7 @@ const manifest = {
         {
             type: 'movie',
             id: 'hstream-popular',
-            name: 'Most Viewed',
+            name: 'HStream - Most Viewed',
             extra: [
                 { name: 'skip', isRequired: false },
                 { name: 'search', isRequired: false }
@@ -51,7 +51,7 @@ const manifest = {
         {
             type: 'movie',
             id: 'hstream-recent',
-            name: 'Latest',
+            name: 'HStream - Latest',
             extra: [
                 { name: 'skip', isRequired: false },
                 { name: 'search', isRequired: false }
@@ -254,7 +254,7 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
         }
 
         // Extract items even if some elements are not fully loaded
-        const items = await page.evaluate(() => {
+        const pageItems = await page.evaluate((catalogType) => {
             const results = [];
             const containers = [
                 ...document.querySelectorAll('div[wire\\:key^="episode-"]'),
@@ -274,13 +274,19 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
                     const href = link.href;
                     if (!href.includes('/hentai/')) return;
                     
+                    const episodeMatch = href.match(/-(\d+)$/);
+                    const episodeNumber = episodeMatch ? episodeMatch[1] : null;
+                    
                     const urlParts = href.split('/hentai/');
                     if (urlParts.length < 2) return;
                     
                     const rawId = urlParts[1];
                     const baseId = rawId.replace(/\/?(?:-watch)?(?:-online)?(?:-free)?(?:-streaming)?(?:-sub)?(?:-eng)?(?:-ita)?(?:-\d+)?$/, '');
-                    const episodeMatch = href.match(/-(\d+)$/);
-                    const id = episodeMatch ? `${baseId}-${episodeMatch[1]}` : baseId;
+                    const id = episodeNumber ? `${baseId}-${episodeNumber}` : baseId;
+                    if (!id) return;
+                    
+                    // Include catalog type in the ID
+                    const fullId = `hstream:${catalogType}:${id}`;
                     
                     const titleCandidates = [
                         link.querySelector('div.absolute p.text-sm'),
@@ -328,26 +334,27 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
                     }
                     
                     results.push({
-                        id: `hstream:${id}`,
+                        id: fullId,
                         type: 'movie',
                         name: title,
                         poster: poster,
                         posterShape: 'poster',
-                        link: href
+                        link: href,
+                        episodeNumber: episodeNumber
                     });
                 } catch (err) {
                     console.error(`Error processing item ${index}:`, err);
                 }
             });
             return results;
-        });
+        }, catalogType);
 
-        return items;
+        return pageItems;
     } catch (error) {
-        debug(`Error processing page ${pageNum}:`, error.message);
+        console.error(`Error processing page ${pageNum}:`, error);
         return [];
     } finally {
-        await page.close().catch(() => {});
+        if (page) await page.close().catch(() => {});
     }
 }
 
@@ -379,8 +386,10 @@ async function fetchVideoDetails(url) {
                 else if (requestUrl.includes('480')) quality = '480p';
                 else if (requestUrl.includes('360')) quality = '360p';
                 
-                // Use quality as key to prevent duplicates
-                streams.set(quality, { url: requestUrl, quality });
+                // Only add streams with known quality
+                if (quality !== 'Unknown') {
+                    streams.set(quality, { url: requestUrl, quality });
+                }
                 request.abort();
             } else {
                 request.continue();
@@ -609,7 +618,8 @@ async function fetchVideoDetails(url) {
         const uniqueStreams = Array.from(streams.values())
             .filter(stream => {
                 try {
-                    return new URL(stream.url).protocol === 'https:';
+                    // Filter out streams with unknown quality and ensure HTTPS
+                    return stream.quality !== 'Unknown' && new URL(stream.url).protocol === 'https:';
                 } catch {
                     return false;
                 }
@@ -634,7 +644,7 @@ async function fetchVideoDetails(url) {
                 return streamData;
             });
 
-        debug(`Found ${uniqueStreams.length} streams with ${videoData.subtitles.length} subtitle tracks`);
+        debug(`Found ${uniqueStreams.length} valid streams with ${videoData.subtitles?.length || 0} subtitle tracks`);
 
         const result = {
             ...meta,
@@ -691,22 +701,27 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 builder.defineMetaHandler(async ({ id }) => {
     debug('Meta request for id:', id);
     
-    // Get all items from the global cache
-    const allItems = catalogCache.get('catalog-all') || [];
-    debug(`Searching for item ${id} in ${allItems.length} cached items`);
+    // Extract catalog type from ID
+    const [prefix, catalogType, ...rest] = id.split(':');
+    const itemId = rest.join(':'); // In case the original ID contained colons
+    debug(`Processing meta request for ${catalogType} catalog, item ID: ${itemId}`);
+    
+    // Get items from the correct cache
+    const cacheKey = `catalog-${catalogType}-all`;
+    const cachedItems = catalogCache.get(cacheKey) || [];
+    debug(`Searching for item in ${cachedItems.length} cached items from ${catalogType} catalog`);
     
     // Find the item in the cache
-    let item = allItems.find(i => i.id === id);
+    let item = cachedItems.find(i => i.id === id);
     
     // If not found in cache, try to load more pages until we find it
     if (!item) {
         debug('Item not found in cache, trying to load more pages');
-        let pageNum = Math.floor(allItems.length / ITEMS_PER_PAGE) + 1;
+        let pageNum = 1;
         let found = false;
+        let browser;
         
-        while (!found) {
-            debug(`Trying to load page ${pageNum}`);
-            let browser;
+        while (!found && pageNum <= MAX_PAGES) {
             try {
                 browser = await launchBrowser();
                 const page = await browser.newPage();
@@ -714,7 +729,7 @@ builder.defineMetaHandler(async ({ id }) => {
                 await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
                 await page.setJavaScriptEnabled(true);
                 
-                const baseUrl = `https://hstream.moe/search?view=poster&order=view-count&page=${pageNum}`;
+                const baseUrl = `https://hstream.moe/search?view=poster&order=${catalogType === 'recent' ? 'recently-released' : 'view-count'}&page=${pageNum}`;
                 debug(`Fetching catalog from: ${baseUrl}`);
                 
                 const response = await page.goto(baseUrl, { 
@@ -731,109 +746,16 @@ builder.defineMetaHandler(async ({ id }) => {
                 await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
                 await delay(1000);
                 
-                const pageItems = await page.evaluate(() => {
-                    const results = [];
-                    const containers = [
-                        ...document.querySelectorAll('div[wire\\:key^="episode-"]'),
-                        ...document.querySelectorAll('div.grid > div'),
-                        ...document.querySelectorAll('div.grid > a'),
-                        ...document.querySelectorAll('div[role="grid"] > div'),
-                        ...document.querySelectorAll('div.grid div[role="gridcell"]'),
-                        ...document.querySelectorAll('div.relative.p-1.mb-8.w-full'),
-                        ...document.querySelectorAll('div.grid div.relative')
-                    ];
-                    
-                    containers.forEach((item, index) => {
-                        try {
-                            const link = item.tagName === 'A' ? item : item.querySelector('a');
-                            if (!link || !link.href) return;
-                            
-                            const href = link.href;
-                            if (!href.includes('/hentai/')) return;
-                            
-                            // Extract episode number if present
-                            const episodeMatch = href.match(/-(\d+)$/);
-                            const episodeNumber = episodeMatch ? episodeMatch[1] : null;
-                            
-                            const urlParts = href.split('/hentai/');
-                            if (urlParts.length < 2) return;
-                            
-                            const rawId = urlParts[1];
-                            // Modify the ID to include episode number if present
-                            const baseId = rawId.replace(/\/?(?:-watch)?(?:-online)?(?:-free)?(?:-streaming)?(?:-sub)?(?:-eng)?(?:-ita)?(?:-\d+)?$/, '');
-                            const id = episodeNumber ? `${baseId}-${episodeNumber}` : baseId;
-                            if (!id) return;
-                            
-                            const titleCandidates = [
-                                link.querySelector('div.absolute p.text-sm'),
-                                link.querySelector('p.text-sm'),
-                                item.querySelector('div.absolute p.text-sm'),
-                                item.querySelector('p.text-sm'),
-                                link.querySelector('[title]'),
-                                item.querySelector('[title]'),
-                                link.querySelector('img[alt]'),
-                                item.querySelector('img[alt]')
-                            ];
-                            
-                            let title = 'Unknown Title';
-                            for (const candidate of titleCandidates) {
-                                if (candidate) {
-                                    const text = candidate.textContent?.trim() || 
-                                               candidate.getAttribute('title')?.trim() ||
-                                               candidate.getAttribute('alt')?.trim();
-                                    if (text) {
-                                        title = text;
-                                        break;
-                                    }
-                                }
-                            }
-                            
-                            // Add episode number to title if present
-                            if (episodeNumber) {
-                                title = `${title} - ${episodeNumber}`;
-                            }
-                            
-                            const imgCandidates = [
-                                link.querySelector('img'),
-                                item.querySelector('img')
-                            ];
-                            
-                            let poster = '';
-                            for (const img of imgCandidates) {
-                                if (img) {
-                                    poster = img.src || img.getAttribute('data-src') || '';
-                                    if (poster) break;
-                                }
-                            }
-                            
-                            if (poster && !poster.startsWith('http')) {
-                                poster = `https://hstream.moe${poster}`;
-                            }
-                            
-                            results.push({
-                                id: `hstream:${id}`,
-                                type: 'movie',
-                                name: title,
-                                poster: poster,
-                                posterShape: 'poster',
-                                link: href,
-                                episodeNumber: episodeNumber
-                            });
-                        } catch (err) {
-                            console.error(`Error processing item ${index}:`, err);
-                        }
-                    });
-                    return results;
-                });
+                const pageItems = await fetchPage(browser, pageNum, '', catalogType);
                 
                 if (pageItems.length === 0) {
                     debug(`No items found on page ${pageNum}, stopping search`);
                     break;
                 }
                 
-                // Add new items to global cache
-                allItems.push(...pageItems);
-                catalogCache.set('catalog-all', allItems);
+                // Add new items to cache
+                cachedItems.push(...pageItems);
+                catalogCache.set(cacheKey, cachedItems);
                 
                 // Check if we found our item
                 item = pageItems.find(i => i.id === id);
@@ -854,7 +776,7 @@ builder.defineMetaHandler(async ({ id }) => {
     }
     
     if (!item) {
-        debug(`Item ${id} not found in any page`);
+        debug(`Item ${id} not found in catalog`);
         return { meta: null };
     }
     
