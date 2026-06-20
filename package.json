@@ -1,6 +1,6 @@
 {
 	"name": "hstream-stremio-addon",
-	"version": "1.2.0",
+	"version": "1.4.0",
 	"description": "Stremio addon for hstream.moe",
 	"main": "addon.js",
 	"scripts": {
@@ -12,8 +12,7 @@
 		"puppeteer-core": "^19.4.0",
 		"@sparticuz/chromium": "^119.0.0",
 		"express": "^4.18.2",
-		"cors": "^2.8.5",
-		"ip": "^1.1.8"
+		"cors": "^2.8.5"
 	},
 	"engines": {
 		"node": ">=16"

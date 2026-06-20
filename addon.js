@@ -18,25 +18,40 @@ if (isRender) {
 const app = express();
 const port = process.env.PORT || 7000;
 
-// Get server URL based on environment
+// Get server URL based on environment. Used to build absolute subtitle URLs,
+// so it must resolve to an address Stremio can actually reach.
 function getServerURL() {
     if (process.env.RENDER) {
         return `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`;
     }
-    try {
-        const ip = require('ip');
-        return `http://${ip.address()}:${port}`;
-    } catch (e) {
-        return `http://localhost:${port}`;
+    if (process.env.ADDON_PUBLIC_URL) {
+        return process.env.ADDON_PUBLIC_URL.replace(/\/+$/, '');
     }
+    try {
+        const os = require('os');
+        const ifaces = os.networkInterfaces();
+        let candidate = null;
+        for (const name of Object.keys(ifaces)) {
+            for (const i of ifaces[name]) {
+                if (i.family !== 'IPv4' || i.internal) continue;
+                if (i.address.startsWith('169.254.')) continue;        // link-local
+                if (i.address.startsWith('192.168.56.')) continue;     // common virtual adapter
+                if (!candidate) candidate = i.address;                  // first real LAN IP wins
+            }
+        }
+        if (candidate) return `http://${candidate}:${port}`;
+    } catch (e) {
+        debug('Could not determine LAN IP:', e.message);
+    }
+    return `http://localhost:${port}`;
 }
 
 // Configurazione aggiornata
 const manifest = {
     id: 'org.hstreammoe',
-    version: '1.2.0',
+    version: '1.4.0',
     name: 'HStream',
-    description: 'Watch videos from hstream.moe with quality selection',
+    description: 'Watch videos from hstream.moe with per-episode quality selection (up to 4K) and subtitles',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie'],
     idPrefixes: ['hstream:'],
@@ -49,17 +64,17 @@ const manifest = {
                 { name: 'skip', isRequired: false },
                 { name: 'search', isRequired: false }
             ],
-            pageSize: 500
+            pageSize: 100
         },
         {
             type: 'movie',
             id: 'hstream-recent',
-            name: 'HStream - Latest',
+            name: 'HStream - Recently Released',
             extra: [
                 { name: 'skip', isRequired: false },
                 { name: 'search', isRequired: false }
             ],
-            pageSize: 500
+            pageSize: 100
         }
     ],
     logo: 'https://hstream.moe/images/cropped-HS-1-270x270.webp',
@@ -103,9 +118,141 @@ const catalogCache = new Cache(3 * 60 * 60 * 1000);
 const metaCache = new Cache(6 * 60 * 60 * 1000);
 const streamCache = new Cache(1 * 60 * 60 * 1000);
 
-const ITEMS_PER_PAGE = 500;  // Aumentato da 100 a 500
-const MAX_PAGES = 20;  // Questo ci darà un massimo di 10000 elementi
-const CONCURRENT_PAGES = 5;  // Manteniamo 5 pagine in parallelo
+const SITE_PAGE_SIZE = 25;   // hstream.moe returns 25 items per search page
+const STREMIO_PAGE = 100;    // how many items we hand back to Stremio per request (matches manifest pageSize)
+const MAX_SITE_PAGES = 200;  // safety ceiling (~5000 items)
+const CONCURRENT_PAGES = 5;  // site pages fetched in parallel per batch
+
+// Cache for converted subtitles (key = .ass url -> srt text)
+const subsCache = new Cache(12 * 60 * 60 * 1000);
+
+// Map hstream language names -> ISO 639-2 codes used by Stremio
+const LANG_MAP = {
+    'English': 'eng', 'German': 'ger', 'Spanish': 'spa', 'French': 'fre',
+    'Hindi': 'hin', 'Portuguese': 'por', 'Russian': 'rus', 'Italian': 'ita',
+    'Japanese': 'jpn', 'Chinese': 'chi', 'Arabic': 'ara'
+};
+
+// hstream encodes quality in the <source size="..."> attribute.
+// The "i" variants (1081/2161) are the 48fps interpolated versions.
+const QUALITY_INFO = {
+    '2161': { label: '2160p (4K) 48FPS', rank: 6 },
+    '2160': { label: '2160p (4K)',       rank: 5 },
+    '1081': { label: '1080p 48FPS',      rank: 4 },
+    '1080': { label: '1080p',            rank: 3 },
+    '720':  { label: '720p',             rank: 2 },
+    '480':  { label: '480p',             rank: 1 },
+    '360':  { label: '360p',             rank: 0 }
+};
+
+function qualityInfo(size) {
+    return QUALITY_INFO[String(size)] || { label: size ? `${size}p` : 'Unknown', rank: -1 };
+}
+
+// Minimal HTTP(S) GET that returns the body as a string (follows one level of redirect).
+function httpGet(url, redirects = 3) {
+    return new Promise((resolve, reject) => {
+        let lib;
+        try {
+            lib = url.startsWith('https') ? require('https') : require('http');
+        } catch (e) {
+            return reject(e);
+        }
+        const req = lib.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://hstream.moe/'
+            }
+        }, res => {
+            if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects > 0) {
+                res.resume();
+                return resolve(httpGet(res.headers.location, redirects - 1));
+            }
+            if (res.statusCode !== 200) {
+                res.resume();
+                return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+            }
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        });
+        req.on('error', reject);
+        req.setTimeout(30000, () => req.destroy(new Error('Subtitle request timeout')));
+    });
+}
+
+// Convert an ASS timestamp (H:MM:SS.cs, centiseconds) to milliseconds.
+function assTimeToMs(t) {
+    const m = String(t).trim().match(/(\d+):(\d{2}):(\d{2})[.:](\d{1,3})/);
+    if (!m) return null;
+    const [, h, mm, ss, frac] = m;
+    const cs = frac.length === 2 ? parseInt(frac, 10) * 10 : parseInt(frac.padEnd(3, '0').slice(0, 3), 10);
+    return ((parseInt(h, 10) * 3600 + parseInt(mm, 10) * 60 + parseInt(ss, 10)) * 1000) + cs;
+}
+
+function msToSrtTime(ms) {
+    const h = Math.floor(ms / 3600000);
+    const m = Math.floor((ms % 3600000) / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    const millis = ms % 1000;
+    const p = (n, l = 2) => String(n).padStart(l, '0');
+    return `${p(h)}:${p(m)}:${p(s)},${p(millis, 3)}`;
+}
+
+// Strip ASS override tags / drawing commands and normalise line breaks.
+function stripAssText(text) {
+    return text
+        .replace(/\{[^}]*\}/g, '')   // {\override} blocks
+        .replace(/\\[Nn]/g, '\n')     // hard / soft line breaks
+        .replace(/\\h/g, ' ')          // hard space
+        .replace(/[ \t]+/g, ' ')
+        .trim();
+}
+
+// Convert a full ASS subtitle file into SRT text that Stremio can render.
+function assToSrt(ass) {
+    const lines = ass.split(/\r?\n/);
+    let inEvents = false;
+    let format = null;
+    const events = [];
+
+    for (const raw of lines) {
+        const line = raw.trim();
+        if (/^\[Events\]/i.test(line)) { inEvents = true; continue; }
+        if (/^\[.+\]$/.test(line)) { inEvents = false; continue; }
+        if (!inEvents) continue;
+
+        if (/^Format\s*:/i.test(line)) {
+            format = line.replace(/^Format\s*:/i, '').split(',').map(s => s.trim().toLowerCase());
+            continue;
+        }
+        if (/^Dialogue\s*:/i.test(line) && format) {
+            const rest = line.replace(/^Dialogue\s*:/i, '');
+            const parts = rest.split(',');
+            const textIdx = format.indexOf('text');
+            const startIdx = format.indexOf('start');
+            const endIdx = format.indexOf('end');
+            if (textIdx === -1 || startIdx === -1 || endIdx === -1) continue;
+            // Text is the last field and may contain commas, so re-join the tail.
+            const text = parts.slice(textIdx).join(',');
+            events.push({
+                start: assTimeToMs(parts[startIdx]),
+                end: assTimeToMs(parts[endIdx]),
+                text: stripAssText(text)
+            });
+        }
+    }
+
+    events.sort((a, b) => (a.start || 0) - (b.start || 0));
+
+    let out = '';
+    let n = 1;
+    for (const e of events) {
+        if (e.start === null || e.end === null || !e.text) continue;
+        out += `${n++}\n${msToSrtTime(e.start)} --> ${msToSrtTime(e.end)}\n${e.text}\n\n`;
+    }
+    return out;
+}
 
 async function launchBrowser() {
     let options = {
@@ -174,62 +321,81 @@ async function launchBrowser() {
     }
 }
 
+// Keep a single Chrome instance warm and reuse it across requests.
+// Relaunching Chrome on every request was the main cause of slow loads.
+let sharedBrowser = null;
+let browserLaunching = null;
+async function getBrowser() {
+    if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
+    if (browserLaunching) return browserLaunching;
+    browserLaunching = launchBrowser().then(b => {
+        sharedBrowser = b;
+        b.on('disconnected', () => { sharedBrowser = null; });
+        browserLaunching = null;
+        return b;
+    }).catch(err => {
+        browserLaunching = null;
+        throw err;
+    });
+    return browserLaunching;
+}
+
 async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
-    debug(`Calculating pagination: skip=${skip}, pageNum=${Math.floor(skip / ITEMS_PER_PAGE) + 1}, catalogType=${catalogType}`);
-    
-    // Manteniamo una cache globale di tutti gli elementi
+    debug(`fetchCatalog: skip=${skip}, catalogType=${catalogType}, search="${search}"`);
+
+    // Global cache of all items scraped so far for this catalog/search.
     const globalCacheKey = search ? `search-${search}-all` : `catalog-${catalogType}-all`;
-    let allItems = catalogCache.get(globalCacheKey) || [];
-    
-    // Se non abbiamo abbastanza elementi nella cache per questo skip, dobbiamo caricare più pagine
-    while (allItems.length < skip + ITEMS_PER_PAGE && allItems.length < MAX_PAGES * ITEMS_PER_PAGE) {
-        const nextPage = Math.floor(allItems.length / ITEMS_PER_PAGE) + 1;
+    const cached = catalogCache.get(globalCacheKey) || { items: [], pagesLoaded: 0, exhausted: false };
+    let { items, pagesLoaded, exhausted } = cached;
+
+    const seen = new Set(items.map(i => i.id));
+    const target = skip + STREMIO_PAGE; // how many items we need to satisfy this request
+
+    // Each hstream search page yields SITE_PAGE_SIZE (25) items. Keep loading
+    // batches of consecutive site pages until we have enough, run out, or hit the ceiling.
+    while (items.length < target && !exhausted && pagesLoaded < MAX_SITE_PAGES) {
         const pagesToLoad = [];
-        
-        // Prepara il batch di pagine da caricare
-        for (let i = 0; i < CONCURRENT_PAGES && nextPage + i <= MAX_PAGES; i++) {
-            pagesToLoad.push(nextPage + i);
+        for (let i = 1; i <= CONCURRENT_PAGES && pagesLoaded + i <= MAX_SITE_PAGES; i++) {
+            pagesToLoad.push(pagesLoaded + i);
         }
-        
         if (pagesToLoad.length === 0) break;
-        
-        debug(`Need more items. Loading pages ${pagesToLoad.join(', ')}`);
 
-        let browser;
+        debug(`Loading site pages ${pagesToLoad.join(', ')} (have ${items.length}, need ${target})`);
+
         try {
-            browser = await launchBrowser();
+            const browser = await getBrowser();
+            const pages = await Promise.all(pagesToLoad.map(p => fetchPage(browser, p, search, catalogType)));
 
-            // Fetch multiple pages in parallel
-            const pagePromises = pagesToLoad.map(pageNum => fetchPage(browser, pageNum, search, catalogType));
-            const pages = await Promise.all(pagePromises);
+            let newCount = 0;
+            let emptyPages = 0;
+            for (const pageItems of pages) {
+                if (!pageItems || pageItems.length === 0) { emptyPages++; continue; }
+                for (const it of pageItems) {
+                    if (it && it.id && !seen.has(it.id)) {
+                        seen.add(it.id);
+                        items.push(it);
+                        newCount++;
+                    }
+                }
+            }
+            pagesLoaded += pagesToLoad.length;
 
-            const pageItems = pages.flat().filter(Boolean);
-
-            if (pageItems.length === 0) {
-                debug(`No items found on pages ${pagesToLoad.join(', ')}, stopping pagination`);
-                break;
+            // If a whole batch produced nothing, we've reached the end of the listing.
+            if (newCount === 0 || emptyPages === pagesToLoad.length) {
+                exhausted = true;
             }
 
-            debug(`Found ${pageItems.length} items on pages ${pagesToLoad.join(', ')}`);
-            debug(`Total items in cache: ${allItems.length + pageItems.length}`);
-            
-            // Aggiungiamo i nuovi elementi alla cache globale
-            allItems = [...allItems, ...pageItems];
-            catalogCache.set(globalCacheKey, allItems);
-
+            catalogCache.set(globalCacheKey, { items, pagesLoaded, exhausted });
+            debug(`Now have ${items.length} unique items (pagesLoaded=${pagesLoaded}, exhausted=${exhausted})`);
         } catch (error) {
-            console.error(`Error fetching pages ${pagesToLoad.join(', ')}:`, error);
+            console.error(`Error fetching site pages ${pagesToLoad.join(', ')}:`, error.message);
             break;
-        } finally {
-            if (browser) await browser.close();
         }
     }
 
-    // Restituiamo la porzione richiesta degli elementi
-    const start = skip;
-    const end = Math.min(skip + ITEMS_PER_PAGE, allItems.length);
-    debug(`Returning items from ${start} to ${end} (total items: ${allItems.length})`);
-    return allItems.slice(start, end);
+    const slice = items.slice(skip, skip + STREMIO_PAGE);
+    debug(`Returning ${slice.length} items (skip=${skip}, total cached=${items.length})`);
+    return slice;
 }
 
 async function fetchPage(browser, pageNum, search = '', catalogType = 'popular') {
@@ -284,14 +450,12 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
             return [];
         }
 
-        // Wait for content with a more specific selector
+        // Wait for the actual episode links (present in the server-rendered HTML);
+        // lighter and faster than waiting for the grid container to become "visible".
         try {
-            await page.waitForSelector('div.grid', { 
-                timeout: 30000,
-                visible: true 
-            });
+            await page.waitForSelector('a[href*="/hentai/"]', { timeout: 20000 });
         } catch (error) {
-            debug(`Timeout waiting for grid on page ${pageNum}, trying to continue anyway`);
+            debug(`Timeout waiting for episode links on page ${pageNum}, trying to continue anyway`);
         }
 
         // Extract items even if some elements are not fully loaded
@@ -353,15 +517,16 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
                         }
                     }
                     
-                    if (episodeMatch) {
+                    // Append the episode number only if the title doesn't already end with it.
+                    if (episodeMatch && !new RegExp(`-\\s*${episodeMatch[1]}\\s*$`).test(title)) {
                         title = `${title} - ${episodeMatch[1]}`;
                     }
-                    
+
                     const imgCandidates = [
                         link.querySelector('img'),
                         item.querySelector('img')
                     ];
-                    
+
                     let poster = '';
                     for (const img of imgCandidates) {
                         if (img) {
@@ -369,11 +534,23 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
                             if (poster) break;
                         }
                     }
-                    
+
                     if (poster && !poster.startsWith('http')) {
                         poster = `https://hstream.moe${poster}`;
                     }
-                    
+
+                    // Card badges: either the quality (e.g. "4k | FHD 48fps") and/or
+                    // content tags (e.g. "Scat + Horror"), depending on the title.
+                    const badgeEls = [...link.querySelectorAll('div.rounded-full, span.rounded-full')];
+                    const badges = [...new Set(
+                        badgeEls.map(b => b.textContent.replace(/\s+/g, ' ').trim())
+                                .filter(t => t && t.length <= 50 && !/^\d+$/.test(t))
+                    )];
+                    const qualityBadge = badges.join(' | ');
+                    // View count next to the eye icon.
+                    const eye = link.querySelector('i.fa-eye') || item.querySelector('i.fa-eye');
+                    const views = eye?.parentElement?.textContent.trim() || '';
+
                     results.push({
                         id: fullId,
                         type: 'movie',
@@ -381,7 +558,9 @@ async function fetchPage(browser, pageNum, search = '', catalogType = 'popular')
                         poster: poster,
                         posterShape: 'poster',
                         link: href,
-                        episodeNumber: episodeNumber
+                        episodeNumber: episodeNumber,
+                        quality: qualityBadge,
+                        views: views
                     });
                 } catch (err) {
                     console.error(`Error processing item ${index}:`, err);
@@ -409,296 +588,177 @@ async function fetchVideoDetails(url) {
     const cached = streamCache.get(cacheKey);
     if (cached) return cached;
 
-    let browser;
+    let page;
     try {
-        browser = await launchBrowser();
-        const page = await browser.newPage();
-        
+        const browser = await getBrowser();
+        page = await browser.newPage();
+
+        // Block heavy resources for speed; we only need the rendered DOM.
+        // The <source>/<a .ass> elements are server-rendered, so blocking
+        // images/css/fonts/the actual video does not remove them.
         await page.setRequestInterception(true);
-        const streams = new Map(); // Using Map to prevent duplicates
-        
         page.on('request', request => {
-            const requestUrl = request.url();
-            if (requestUrl.match(/\.(m3u8|mp4|mkv|avi|mov)(\?|$)/i)) {
-                let quality = 'Unknown';
-                if (requestUrl.includes('2160')) quality = '4k';
-                else if (requestUrl.includes('1080')) quality = '1080p';
-                else if (requestUrl.includes('720')) quality = '720p';
-                else if (requestUrl.includes('480')) quality = '480p';
-                else if (requestUrl.includes('360')) quality = '360p';
-                
-                // Use quality as key to prevent duplicates
-                streams.set(quality, { url: requestUrl, quality });
+            const t = request.resourceType();
+            if (t === 'image' || t === 'stylesheet' || t === 'font' || t === 'media') {
                 request.abort();
             } else {
                 request.continue();
             }
         });
 
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
         debug(`Fetching video details from: ${url}`);
-        await page.goto(url, { 
-            waitUntil: 'networkidle2', 
-            timeout: 60000 
-        });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-        // Wait for video player to load
-        await page.waitForSelector('video', { timeout: 30000 });
+        // The quality <source> tags are injected by the player JS shortly after load,
+        // so wait for an actual <source src> rather than the (initially empty) <video>.
+        try {
+            await page.waitForSelector('video source[src]', { timeout: 30000 });
+        } catch (e) {
+            debug('No <source> appeared in time, extracting whatever is present');
+            await delay(2000);
+        }
 
-        // Get video sources and subtitles from the page
-        const videoData = await page.evaluate(() => {
-            const sources = new Map();
-            const subtitles = new Map();
-            
-            console.log('Searching for subtitle download links...');
-            // Extract subtitles from download links first (higher priority)
-            const subtitleButtons = document.querySelectorAll('button.group.rounded-md.shadow.bg-rose-600');
-            console.log(`Found ${subtitleButtons.length} potential subtitle buttons`);
-            
-            subtitleButtons.forEach(button => {
-                const link = button.querySelector('a[href*=".ass"], a[href*=".srt"], a[href*=".vtt"]');
-                if (!link) return;
-
-                const href = link.getAttribute('href');
-                if (!href) return;
-
-                // Get language from button text
-                const buttonText = button.textContent.trim();
-                const langMatch = buttonText.match(/^([A-Za-z]+)/);
-                
-                // Map language codes to ISO 639-2 codes
-                const langMap = {
-                    'English': 'eng',
-                    'German': 'ger',
-                    'Spanish': 'spa',
-                    'French': 'fre',
-                    'Hindi': 'hin',
-                    'Portuguese': 'por',
-                    'Russian': 'rus',
-                    'Italian': 'ita'
-                };
-
-                let lang = langMatch ? langMatch[1] : 'English';
-                const langCode = langMap[lang] || 'eng';
-
-                // Check if it's auto-translated
-                const isAuto = buttonText.toLowerCase().includes('auto translated');
-                
-                subtitles.set(lang, {
-                    url: href,
-                    lang: langCode,
-                    id: langCode,
-                    name: `${lang}${isAuto ? ' (Auto)' : ''}`
+        // Extract every quality <source>, every subtitle (.ass/.srt/.vtt) link, and meta.
+        const data = await page.evaluate(() => {
+            // --- video sources (one per quality) ---
+            const sources = [];
+            const seen = new Set();
+            document.querySelectorAll('video source[src]').forEach(source => {
+                const src = source.getAttribute('src');
+                if (!src || !/^https?:/i.test(src) || seen.has(src)) return;
+                seen.add(src);
+                sources.push({
+                    url: src,
+                    size: source.getAttribute('size') || source.getAttribute('label') || source.getAttribute('title') || '',
+                    mode: source.getAttribute('mode') || ''
                 });
             });
-            
-            // Extract subtitles from tracks as fallback
-            console.log('Searching for track elements...');
-            document.querySelectorAll('track[kind="subtitles"], track[kind="captions"]').forEach(track => {
-                if (track.src) {
-                    const lang = track.srclang || 'und';
-                    const label = track.label || lang;
-                    console.log('Found track subtitle:', { src: track.src, lang, label });
-                    
-                    subtitles.set(lang, {
-                        url: track.src,
-                        lang: lang,
-                        id: label,
-                        format: track.src.split('.').pop().toLowerCase()
-                    });
-                }
+
+            // --- subtitles: direct download links (.ass / .srt / .vtt) ---
+            const subtitles = [];
+            const subSeen = new Set();
+            document.querySelectorAll('a[href*=".ass"], a[href*=".srt"], a[href*=".vtt"]').forEach(a => {
+                const href = a.getAttribute('href');
+                if (!href || subSeen.has(href)) return;
+                subSeen.add(href);
+                // Language: prefer visible text, fall back to the download filename.
+                const text = (a.textContent || '').trim();
+                const dl = a.getAttribute('download') || '';
+                const langName = (text.match(/[A-Za-z]+/) || dl.match(/-([A-Za-z]+)\.(?:ass|srt|vtt)$/i) || [])[0] ||
+                                 (dl.match(/-([A-Za-z]+)\.(?:ass|srt|vtt)$/i) || [])[1] || 'English';
+                const isAuto = text.toLowerCase().includes('auto');
+                const format = (href.split('.').pop() || '').toLowerCase().split(/[?#]/)[0];
+                subtitles.push({ url: href, langName: langName.trim(), isAuto, format });
             });
 
-            // Process video sources
-            const videos = document.querySelectorAll('video');
-            videos.forEach(video => {
-                if (video.src) {
-                    const quality = video.getAttribute('size') || 'Default';
-                    sources.set(quality, {
-                        url: video.src,
-                        quality: quality
-                    });
-                }
-                
-                video.querySelectorAll('source').forEach(source => {
-                    if (source.src) {
-                        const quality = source.getAttribute('size') || 
-                                      source.getAttribute('label') || 
-                                      source.getAttribute('title') || 
-                                      'Unknown';
-                        sources.set(quality, {
-                            url: source.src,
-                            quality: quality
-                        });
-                    }
-                });
-
-                // Check for text tracks in video elements
-                video.querySelectorAll('track').forEach(track => {
-                    if (track.src && (track.kind === 'subtitles' || track.kind === 'captions')) {
-                        const lang = track.srclang || 'und';
-                        const label = track.label || lang;
-                        console.log('Found video track subtitle:', { src: track.src, lang, label });
-                        
-                        subtitles.set(lang, {
-                            url: track.src,
-                            lang: lang,
-                            id: label,
-                            format: track.src.split('.').pop().toLowerCase()
-                        });
-                    }
-                });
-            });
-            
-            const subtitleArray = Array.from(subtitles.values());
-            console.log(`Found ${subtitleArray.length} unique subtitles:`, subtitleArray);
-            
-            return {
-                sources: Array.from(sources.values()),
-                subtitles: subtitleArray
-            };
-        });
-
-        // Add video sources to our streams Map
-        videoData.sources.forEach(source => {
-            if (!streams.has(source.quality)) {
-                streams.set(source.quality, source);
-            }
-        });
-
-        const meta = await page.evaluate(() => {
-            // Get title from multiple sources
-            const title = document.querySelector('h1')?.textContent.trim() || 
-                         document.title.replace(' - HStream', '').replace(/in 4k.*$/, '').trim();
-            
-            // Get Japanese title if available
+            // --- meta ---
+            const title = document.querySelector('h1')?.textContent.trim() ||
+                          document.title.replace(' - HStream', '').replace(/in 4k.*$/, '').trim();
             const japaneseTitle = document.querySelector('h2.inline')?.textContent.trim();
-            
-            // Get description from meta tags first (usually more complete)
             const description = document.querySelector('meta[name="description"]')?.content ||
-                              document.querySelector('meta[property="og:description"]')?.content ||
-                              document.querySelector('.text-gray-800.dark\\:text-gray-200.leading-tight')?.textContent.trim() ||
-                              '';
-
-            // Get release date
-            const releaseDate = document.querySelector('a[data-te-toggle="tooltip"][title*="Released"]')?.textContent
+                                document.querySelector('meta[property="og:description"]')?.content ||
+                                document.querySelector('.text-gray-800.dark\\:text-gray-200.leading-tight')?.textContent.trim() ||
+                                '';
+            const releaseInfo = document.querySelector('a[data-te-toggle="tooltip"][title*="Released"]')?.textContent
                                 .match(/\d{4}-\d{2}-\d{2}/)?.[0];
-
-            // Get studio
-            const studio = document.querySelector('a[href*="studios"]')?.textContent.trim();
-
-            // Get all tags/genres
-            const genres = Array.from(document.querySelectorAll('ul li a[href*="tags"]'))
-                .map(tag => tag.textContent.trim())
-                .filter(tag => tag.length > 0);
-
-            // Get view count
+            const studio = document.querySelector('a[href*="studios"], a[href*="studio"], a[href*="brand"]')?.textContent.trim();
+            // Genres/tags links look like ?tags[0]=big-boobs . Drop the pure quality
+            // tags (4k / 48fps) since quality is already a separate stream choice.
+            const genres = [...new Set(
+                Array.from(document.querySelectorAll('a[href*="tags%5B"], a[href*="tags["]'))
+                    .map(tag => tag.textContent.replace(/\s+/g, ' ').trim())
+                    .filter(Boolean)
+                    .filter(t => !/^(4k|48fps|4k\s*48fps)$/i.test(t))
+            )];
             const viewCount = document.querySelector('a.text-xl i.fa-eye')?.nextSibling?.textContent.trim();
-
-            // Get episode number
             const episodeNumber = title.match(/\s*-\s*(\d+)$/)?.[1];
 
-            // Get subtitles
-            const subtitles = [];
-            const subtitleButtons = document.querySelectorAll('button.group.rounded-md.shadow.bg-rose-600');
-            
-            subtitleButtons.forEach(button => {
-                const link = button.querySelector('a[href*=".ass"], a[href*=".srt"], a[href*=".vtt"]');
-                if (!link) return;
+            return { sources, subtitles, title, japaneseTitle, description, releaseInfo, studio, genres, viewCount, episodeNumber };
+        });
 
-                const href = link.getAttribute('href');
-                if (!href) return;
+        await page.close().catch(() => {});
+        page = null;
 
-                // Get language from button text
-                const buttonText = button.textContent.trim();
-                const langMatch = buttonText.match(/^([A-Za-z]+)/);
-                
-                // Map language codes to ISO 639-2 codes
-                const langMap = {
-                    'English': 'eng',
-                    'German': 'ger',
-                    'Spanish': 'spa',
-                    'French': 'fre',
-                    'Hindi': 'hin',
-                    'Portuguese': 'por',
-                    'Russian': 'rus',
-                    'Italian': 'ita'
-                };
-
-                let lang = langMatch ? langMatch[1] : 'English';
-                const langCode = langMap[lang] || 'eng';
-
-                // Check if it's auto-translated
-                const isAuto = buttonText.toLowerCase().includes('auto translated');
-                
-                subtitles.push({
-                    url: href,
-                    lang: langCode,
-                    id: langCode,
-                    name: `${lang}${isAuto ? ' (Auto)' : ''}`
-                });
-            });
-
+        // Build Stremio subtitle objects, routed through our own SRT-conversion endpoint
+        // (hstream serves .ass, which Stremio cannot render).
+        const serverUrl = getServerURL();
+        const subtitles = data.subtitles.map(sub => {
+            let absUrl = sub.url;
+            if (!/^https?:/i.test(absUrl)) {
+                absUrl = absUrl.startsWith('//') ? `https:${absUrl}` : `https://hstream.moe${absUrl.startsWith('/') ? '' : '/'}${absUrl}`;
+            }
+            const langCode = LANG_MAP[sub.langName] || 'eng';
+            const enc = Buffer.from(absUrl).toString('base64url');
             return {
-                title,
-                japaneseTitle,
-                description,
-                releaseInfo: releaseDate,
-                studio,
-                genres,
-                viewCount,
-                episodeNumber,
-                subtitles
+                id: `${langCode}${sub.isAuto ? '-auto' : ''}`,
+                url: `${serverUrl}/subs/${enc}.srt`,
+                lang: langCode
             };
         });
 
-        await browser.close();
-
-        // Convert streams Map to array and format for Stremio
-        const uniqueStreams = Array.from(streams.values())
-            .filter(stream => {
-                try {
-                    return new URL(stream.url).protocol === 'https:';
-                } catch {
-                    return false;
-                }
-            })
-            .map(stream => {
-                const streamData = {
-                    title: stream.quality,
-                    url: stream.url,
-                    name: `${meta.title} (${stream.quality})`
+        // Build one Stremio stream per quality, best first.
+        const streams = data.sources
+            .map(s => ({ ...s, info: qualityInfo(s.size) }))
+            .sort((a, b) => b.info.rank - a.info.rank)
+            .map(s => {
+                const stream = {
+                    name: `HStream\n${s.info.label}`,
+                    title: data.title + (subtitles.length ? `\n🗨 ${subtitles.length} sub` : ''),
+                    url: s.url,
+                    behaviorHints: { bingeGroup: `hstream-${s.size || 'default'}` }
                 };
-
-                if (videoData.subtitles && videoData.subtitles.length > 0) {
-                    streamData.subtitles = videoData.subtitles.map(sub => ({
-                        id: sub.id,
-                        url: sub.url,
-                        lang: sub.lang,
-                        format: sub.format,
-                        name: `${sub.lang.toUpperCase()} Subtitles`
-                    }));
-                }
-
-                return streamData;
+                if (subtitles.length) stream.subtitles = subtitles;
+                return stream;
             });
 
-        debug(`Found ${uniqueStreams.length} streams with ${videoData.subtitles.length} subtitle tracks`);
+        debug(`Found ${streams.length} quality streams with ${subtitles.length} subtitle tracks for "${data.title}"`);
 
         const result = {
-            ...meta,
-            streams: uniqueStreams
+            title: data.title,
+            japaneseTitle: data.japaneseTitle,
+            description: data.description,
+            releaseInfo: data.releaseInfo,
+            studio: data.studio,
+            genres: data.genres,
+            viewCount: data.viewCount,
+            episodeNumber: data.episodeNumber,
+            subtitles,
+            streams
         };
 
         streamCache.set(cacheKey, result);
         return result;
     } catch (error) {
         console.error('Video details error:', error);
-        if (browser) await browser.close();
-        return { 
-            title: 'Unknown', 
-            streams: [] 
-        };
+        if (page) await page.close().catch(() => {});
+        return { title: 'Unknown', streams: [], subtitles: [] };
     }
+}
+
+// Find a catalog item by id, progressively loading more pages if needed.
+// Reuses fetchCatalog so pagination/caching/the shared browser all behave consistently.
+async function findItemById(id, catalogType) {
+    const cacheKey = `catalog-${catalogType}-all`;
+    const getItems = () => (catalogCache.get(cacheKey)?.items) || [];
+
+    let item = getItems().find(i => i.id === id);
+    if (item) return item;
+
+    debug(`Item ${id} not cached, loading more pages to find it`);
+    let lastCount = -1;
+    while (!item) {
+        const skip = getItems().length;
+        if (skip === lastCount) break; // no progress -> avoid infinite loop
+        lastCount = skip;
+        await fetchCatalog(skip, '', catalogType);
+        const items = getItems();
+        item = items.find(i => i.id === id);
+        const cached = catalogCache.get(cacheKey);
+        if (item || !cached || cached.exhausted) break;
+    }
+    return item || null;
 }
 
 // Handlers
@@ -719,18 +779,27 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     } catch (err) {
         console.error('Error parsing extra params:', err);
     }
-    
+
     const catalogType = id === 'hstream-recent' ? 'recent' : 'popular';
     debug(`Processing catalog request: skip=${skip}, search="${search}", type=${catalogType}`);
     const catalog = await fetchCatalog(skip, search, catalogType);
-    
-    const metas = catalog.map(item => ({
+
+    const metas = catalog.map(item => {
+        // Build a short preview description from what the listing card exposes
+        // (real genres only exist on the detail page, which the meta handler fills in).
+        const descParts = [];
+        if (item.quality) descParts.push(item.quality);
+        if (item.views) descParts.push(`👁 ${item.views}`);
+        const meta = {
             id: item.id,
             type: 'movie',
             name: item.name,
             poster: item.poster,
             posterShape: 'poster'
-    }));
+        };
+        if (descParts.length) meta.description = descParts.join('  •  ');
+        return meta;
+    });
 
     debug(`Returning ${metas.length} items for skip=${skip}`);
     return { metas };
@@ -743,81 +812,14 @@ builder.defineMetaHandler(async ({ id }) => {
     const [prefix, catalogType, ...rest] = id.split(':');
     const itemId = rest.join(':'); // In case the original ID contained colons
     debug(`Processing meta request for ${catalogType} catalog, item ID: ${itemId}`);
-    
-    // Get items from the correct cache
-    const cacheKey = `catalog-${catalogType}-all`;
-    const cachedItems = catalogCache.get(cacheKey) || [];
-    debug(`Searching for item in ${cachedItems.length} cached items from ${catalogType} catalog`);
-    
-    // Find the item in the cache
-    let item = cachedItems.find(i => i.id === id);
-    
-    // If not found in cache, try to load more pages until we find it
-    if (!item) {
-        debug('Item not found in cache, trying to load more pages');
-        let pageNum = 1;
-        let found = false;
-        let browser;
-        
-        while (!found && pageNum <= MAX_PAGES) {
-            try {
-                browser = await launchBrowser();
-                const page = await browser.newPage();
-                
-                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-                await page.setJavaScriptEnabled(true);
-                
-                const baseUrl = `https://hstream.moe/search?view=poster&order=${catalogType === 'recent' ? 'recently-released' : 'view-count'}&page=${pageNum}`;
-                debug(`Fetching catalog from: ${baseUrl}`);
-                
-                const response = await page.goto(baseUrl, { 
-                    waitUntil: 'networkidle2', 
-                    timeout: 30000 
-                });
-                
-                if (response.status() !== 200) {
-                    debug(`Page ${pageNum} returned status ${response.status()}, stopping search`);
-                    break;
-                }
-                
-                await page.waitForSelector('div.grid', { timeout: 15000 });
-                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-                await delay(1000);
-                
-                const pageItems = await fetchPage(browser, pageNum, '', catalogType);
-                
-                if (pageItems.length === 0) {
-                    debug(`No items found on page ${pageNum}, stopping search`);
-                    break;
-                }
-                
-                // Add new items to cache
-                cachedItems.push(...pageItems);
-                catalogCache.set(cacheKey, cachedItems);
-                
-                // Check if we found our item
-                item = pageItems.find(i => i.id === id);
-                if (item) {
-                    debug(`Found item on page ${pageNum}`);
-                    found = true;
-                    break;
-                }
-                
-                pageNum++;
-            } catch (error) {
-                console.error(`Error fetching page ${pageNum}:`, error);
-                break;
-            } finally {
-                if (browser) await browser.close();
-            }
-        }
-    }
-    
+
+    const item = await findItemById(id, catalogType);
+
     if (!item) {
         debug(`Item ${id} not found in catalog`);
         return { meta: null };
     }
-    
+
     debug(`Found item: ${item.name}`);
     const details = await fetchVideoDetails(item.link);
     
@@ -850,107 +852,24 @@ builder.defineStreamHandler(async ({ id }) => {
     const [prefix, catalogType, ...rest] = id.split(':');
     const itemId = rest.join(':'); // In case the original ID contained colons
     debug(`Processing stream request for ${catalogType} catalog, item ID: ${itemId}`);
-    
-    // Get items from the correct cache
-    const cacheKey = `catalog-${catalogType}-all`;
-    const cachedItems = catalogCache.get(cacheKey) || [];
-    debug(`Searching for item in ${cachedItems.length} cached items from ${catalogType} catalog`);
-    
-    // Find the item in the cache
-    let item = cachedItems.find(i => i.id === id);
-    
-    // If not found in cache, try to load more pages until we find it
-    if (!item) {
-        debug('Item not found in cache, trying to load more pages');
-        let pageNum = 1;
-        let found = false;
-        let browser;
-        
-        while (!found && pageNum <= MAX_PAGES) {
-            try {
-                browser = await launchBrowser();
-                const page = await browser.newPage();
-                
-                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-                await page.setJavaScriptEnabled(true);
-                
-                const baseUrl = `https://hstream.moe/search?view=poster&order=${catalogType === 'recent' ? 'recently-released' : 'view-count'}&page=${pageNum}`;
-                debug(`Fetching catalog from: ${baseUrl}`);
-                
-                const response = await page.goto(baseUrl, { 
-                    waitUntil: 'networkidle2', 
-                    timeout: 30000 
-                });
-                
-                if (response.status() !== 200) {
-                    debug(`Page ${pageNum} returned status ${response.status()}, stopping search`);
-                    break;
-                }
-                
-                await page.waitForSelector('div.grid', { timeout: 15000 });
-                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-                await delay(1000);
-                
-                const pageItems = await fetchPage(browser, pageNum, '', catalogType);
-                
-                if (pageItems.length === 0) {
-                    debug(`No items found on page ${pageNum}, stopping search`);
-                    break;
-                }
-                
-                // Add new items to cache
-                cachedItems.push(...pageItems);
-                catalogCache.set(cacheKey, cachedItems);
-                
-                // Check if we found our item
-                item = pageItems.find(i => i.id === id);
-                if (item) {
-                    debug(`Found item on page ${pageNum}`);
-                    found = true;
-                    break;
-                }
-                
-                pageNum++;
-            } catch (error) {
-                console.error(`Error fetching page ${pageNum}:`, error);
-                break;
-            } finally {
-                if (browser) await browser.close();
-            }
-        }
-    }
-    
+
+    const item = await findItemById(id, catalogType);
+
     if (!item) {
         debug(`Item ${id} not found in catalog`);
         return { streams: [] };
     }
-    
+
     debug(`Found item: ${item.name}, fetching video details from ${item.link}`);
     const details = await fetchVideoDetails(item.link);
-    
+
+    // Streams already come fully formed (one per quality, subtitles attached).
     if (!details.streams || details.streams.length === 0) {
         debug('No streams found, adding external URL');
-        details.streams = [{
-            title: 'Open in Browser',
-            externalUrl: item.link
-        }];
-    } else {
-        // Add subtitles to all streams
-        details.streams = details.streams.map(stream => {
-            if (details.subtitles && details.subtitles.length > 0) {
-                stream.subtitles = details.subtitles.map(sub => ({
-                    id: sub.id,
-                    url: sub.url,
-                    lang: sub.lang,
-                    name: sub.id
-                }));
-            }
-            return stream;
-        });
-        
-        debug(`Found ${details.streams.length} streams with ${details.subtitles?.length || 0} subtitle tracks`);
+        return { streams: [{ name: 'HStream', title: 'Open in Browser', externalUrl: item.link }] };
     }
-    
+
+    debug(`Returning ${details.streams.length} quality streams with ${details.subtitles?.length || 0} subtitle tracks`);
     return { streams: details.streams };
 });
 
@@ -961,6 +880,38 @@ app.get('/', (_, res) => {
     res.redirect('/manifest.json');
 });
 app.get('/manifest.json', (req, res) => res.json(addonInterface.manifest));
+
+// Subtitle conversion endpoint: fetches the original .ass from hstream's CDN
+// and returns SRT that Stremio can render. The .ass URL is base64url-encoded
+// into the path so the URL ends in .srt (Stremio is picky about extensions).
+app.get('/subs/:enc.srt', async (req, res) => {
+    try {
+        const assUrl = Buffer.from(req.params.enc, 'base64url').toString('utf8');
+        if (!/^https?:\/\//i.test(assUrl)) return res.status(400).send('Invalid url');
+
+        let srt = subsCache.get(assUrl);
+        if (!srt) {
+            const raw = await httpGet(assUrl);
+            // Already SRT/VTT? convert VTT->SRT lightly, pass SRT through, else parse ASS.
+            if (/^\s*WEBVTT/i.test(raw)) {
+                srt = raw.replace(/^\s*WEBVTT.*?\r?\n/i, '').replace(/(\d{2}:\d{2}:\d{2})\.(\d{3})/g, '$1,$2');
+            } else if (/-->/.test(raw) && !/^\[Script Info\]/i.test(raw.trim())) {
+                srt = raw;
+            } else {
+                srt = assToSrt(raw);
+            }
+            if (srt && srt.trim()) subsCache.set(assUrl, srt);
+        }
+
+        res.set('Content-Type', 'application/x-subrip; charset=utf-8');
+        res.set('Access-Control-Allow-Origin', '*');
+        res.send(srt || '');
+    } catch (err) {
+        console.error('Subtitle conversion error:', err.message);
+        res.status(502).send('');
+    }
+});
+
 app.get('/:resource/:type/:id.json', async (req, res) => {
     const { resource, type, id } = req.params;
     const result = await addonInterface.get(resource, type, id, null);
@@ -1002,4 +953,6 @@ app.listen(port, '0.0.0.0', () => {
         console.log(`Local URL: http://127.0.0.1:${port}`);
     }
     console.log(`Install URL: ${serverUrl}/manifest.json`);
+    // Warm up Chrome in the background so the first catalog request is faster.
+    getBrowser().then(() => debug('Browser pre-warmed')).catch(() => {});
 });
