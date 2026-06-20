@@ -1,6 +1,6 @@
 {
 	"name": "hstream-stremio-addon",
-	"version": "1.4.0",
+	"version": "1.4.1",
 	"description": "Stremio addon for hstream.moe",
 	"main": "addon.js",
 	"scripts": {

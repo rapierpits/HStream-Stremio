@@ -49,7 +49,7 @@ function getServerURL() {
 // Configurazione aggiornata
 const manifest = {
     id: 'org.hstreammoe',
-    version: '1.4.0',
+    version: '1.4.1',
     name: 'HStream',
     description: 'Watch videos from hstream.moe with per-episode quality selection (up to 4K) and subtitles',
     resources: ['catalog', 'meta', 'stream'],
@@ -121,7 +121,13 @@ const streamCache = new Cache(1 * 60 * 60 * 1000);
 const SITE_PAGE_SIZE = 25;   // hstream.moe returns 25 items per search page
 const STREMIO_PAGE = 100;    // how many items we hand back to Stremio per request (matches manifest pageSize)
 const MAX_SITE_PAGES = 200;  // safety ceiling (~5000 items)
-const CONCURRENT_PAGES = 5;  // site pages fetched in parallel per batch
+
+// On memory-constrained hosts (Render free = 512MB) keeping Chrome resident and
+// running many parallel tabs causes OOM kills. There we launch/close the browser
+// per operation (like the original code) and scrape fewer pages at once.
+const LOW_MEMORY = isRender || process.env.LOW_MEMORY === '1';
+const PERSISTENT_BROWSER = !LOW_MEMORY;
+const CONCURRENT_PAGES = 5;  // site pages fetched in parallel per batch (matches the original, Render-proven profile)
 
 // Cache for converted subtitles (key = .ass url -> srt text)
 const subsCache = new Cache(12 * 60 * 60 * 1000);
@@ -321,11 +327,16 @@ async function launchBrowser() {
     }
 }
 
-// Keep a single Chrome instance warm and reuse it across requests.
-// Relaunching Chrome on every request was the main cause of slow loads.
+// Browser lifecycle. In persistent mode (local) we keep one Chrome warm and reuse
+// it across requests for speed. In low-memory mode (Render) we launch a fresh
+// browser per operation and close it afterwards to stay within the RAM budget.
 let sharedBrowser = null;
 let browserLaunching = null;
 async function getBrowser() {
+    if (!PERSISTENT_BROWSER) {
+        // Caller is responsible for closing this via closeBrowser().
+        return launchBrowser();
+    }
     if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
     if (browserLaunching) return browserLaunching;
     browserLaunching = launchBrowser().then(b => {
@@ -338,6 +349,13 @@ async function getBrowser() {
         throw err;
     });
     return browserLaunching;
+}
+
+// Only closes the browser in low-memory mode; in persistent mode it's kept warm.
+async function closeBrowser(browser) {
+    if (!PERSISTENT_BROWSER && browser) {
+        await browser.close().catch(() => {});
+    }
 }
 
 async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
@@ -362,8 +380,9 @@ async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
 
         debug(`Loading site pages ${pagesToLoad.join(', ')} (have ${items.length}, need ${target})`);
 
+        let browser;
         try {
-            const browser = await getBrowser();
+            browser = await getBrowser();
             const pages = await Promise.all(pagesToLoad.map(p => fetchPage(browser, p, search, catalogType)));
 
             let newCount = 0;
@@ -390,6 +409,8 @@ async function fetchCatalog(skip = 0, search = '', catalogType = 'popular') {
         } catch (error) {
             console.error(`Error fetching site pages ${pagesToLoad.join(', ')}:`, error.message);
             break;
+        } finally {
+            await closeBrowser(browser);
         }
     }
 
@@ -589,8 +610,9 @@ async function fetchVideoDetails(url) {
     if (cached) return cached;
 
     let page;
+    let browser;
     try {
-        const browser = await getBrowser();
+        browser = await getBrowser();
         page = await browser.newPage();
 
         // Block heavy resources for speed; we only need the rendered DOM.
@@ -734,6 +756,8 @@ async function fetchVideoDetails(url) {
         console.error('Video details error:', error);
         if (page) await page.close().catch(() => {});
         return { title: 'Unknown', streams: [], subtitles: [] };
+    } finally {
+        await closeBrowser(browser);
     }
 }
 
@@ -954,5 +978,8 @@ app.listen(port, '0.0.0.0', () => {
     }
     console.log(`Install URL: ${serverUrl}/manifest.json`);
     // Warm up Chrome in the background so the first catalog request is faster.
-    getBrowser().then(() => debug('Browser pre-warmed')).catch(() => {});
+    // Skip on low-memory hosts (Render) where we launch/close per request instead.
+    if (PERSISTENT_BROWSER) {
+        getBrowser().then(() => debug('Browser pre-warmed')).catch(() => {});
+    }
 });
